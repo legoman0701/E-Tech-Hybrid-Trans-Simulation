@@ -55,36 +55,81 @@ class Engine:
     self.angle += self.speed * dt
 
 class E_Engine:
-  def __init__(self, inertia, name, max_amp=20):
-    self.inertia = inertia
-    self.name = name
-    self.speed = 0
-    self.angle = 0
-    self.torque = 0
-    self.drag = 0.02
-    self.tau0 = 5
-    self.offset = (0, 0)
-    self.throttle = 0
-    self.conected_gear_index = 0
-    self.max_amp = max_amp
-    self.volt = 400
-  
-  def get_toque(self):
-    power = self.volt * self.max_amp * self.throttle
-    omega = self.speed
-    if omega == 0:
-      return power / 1
-    torque = power / omega
-    return torque
-  
-  def apply_physics(self, dt):
-    self.torque += self.get_toque()
-    tau_c = self.tau0 * copysign(1, self.speed) if self.speed != 0 else 0
-    self.speed += (self.torque - tau_c - self.drag*self.speed) / self.inertia * dt
-    if abs(self.speed) < 0.01: self.speed = 0
-    self.torque = 0.0
-    self.angle += self.speed * dt
+    def __init__(self, inertia, name, max_amp=200, volt=230, k_t=0.8, eff=0.9):
+        """
+        inertia [kg·m²], speed [rad/s], torque [N·m]
+        max_amp: inverter phase current limit [A] (effective)
+        volt: DC bus [V]
+        k_t: torque constant [N·m/A]   (τ = k_t * I)
+        eff: mechanical efficiency [-] (P_mech = eff * V * I)
+        """
+        self.inertia = float(inertia)
+        self.name = name
+        self.speed = 0.0
+        self.angle = 0.0
+        self.torque = 0.0                 # external torque accumulator
+        self.drag = 0.02                  # viscous loss coeff [N·m·s/rad]
+        self.tau0 = 5.0                   # Coulomb friction [N·m]
+        self.offset = (0, 0)
+        self.throttle = 0.0               # [-1..1]
+        self.conected_gear_index = 0
+        self.max_amp = float(max_amp)
+        self.volt = float(volt)
+        self.k_t = float(k_t)
+        self.eff = float(eff)
+        self._omega_eps = 1e-3            # avoids div-by-zero in power cap
 
+    @property
+    def omega_base(self):
+        """Knee/base speed where const-torque -> const-power."""
+        return (self.volt * self.eff) / max(self.k_t, 1e-9)  # rad/s
+
+    def get_torque(self):
+        """
+        Current-limited + power-limited available torque (signed).
+        - Constant torque: τ <= k_t * I_cmd
+        - Constant power:  τ <= (V * I_cmd * eff) / |ω|
+        """
+        # Command & sign
+        s = max(-1.0, min(1.0, float(self.throttle)))
+        if s == 0.0:
+            return 0.0
+        sign = 1.0 if s >= 0 else -1.0
+
+        # Requested current (A) and limits
+        I_cmd = abs(s) * self.max_amp
+
+        # Plateau from current limit
+        tau_ct = self.k_t * I_cmd
+
+        # Power cap -> τ = P/ω
+        P_mech_max = self.volt * I_cmd * self.eff
+        omega_mag = abs(self.speed)
+        tau_cp = P_mech_max / max(omega_mag, self._omega_eps)
+
+        # Available torque is the tighter of the two
+        tau_avail = min(tau_ct, tau_cp)
+        return sign * tau_avail
+
+    def apply_physics(self, dt):
+        # Apply motor torque (adds to any externally applied torques)
+        self.torque += self.get_torque()
+
+        # Coulomb friction + viscous drag
+        tau_c = self.tau0 * (1.0 if self.speed > 0 else -1.0) if self.speed != 0 else 0.0
+
+        # ω' = (Στ - τ_c - b*ω) / J
+        self.speed += (self.torque - tau_c - self.drag * self.speed) / self.inertia * dt
+
+        # Deadband near zero to avoid chatter
+        if abs(self.speed) < 0.01:
+            self.speed = 0.0
+
+        # Reset external torque accumulator for next step
+        self.torque = 0.0
+
+        # Integrate angle
+        self.angle += self.speed * dt
 
 Engines = [None]*3
 displayed_numbers = [0, 1, 2, 3, 4, 5, 6]
@@ -93,8 +138,8 @@ displayed_numbers.reverse()
 MCI, HSG, MEP = 0, 1, 2
 
 Engines[MCI] = Engine(0.12, "1.6l Engine")
-Engines[HSG] = E_Engine(0.06, "HSG", max_amp=20)  # High Voltage Starter Generator
-Engines[MEP] = E_Engine(0.06, "MEP", max_amp=200)  # Main Electric Propulsion
+Engines[HSG] = E_Engine(0.06, "HSG", max_amp=75)  # High Voltage Starter Generator
+Engines[MEP] = E_Engine(0.06, "MEP", max_amp=180)  # Main Electric Propulsion
 
 def draw_rpm_gauge(e, pos, screen):
   # screen is expected to be a numpy array (cv2 image)
@@ -432,13 +477,13 @@ def main():
     else:
       Engines[MCI].throttle = max(0, Engines[MCI].throttle - 0.01)
 
-    if keys[pygame.K_m]:
+    if keys[pygame.K_a]:
       Engines[MEP].throttle = min(1, Engines[MEP].throttle + 0.01)
     else:
       Engines[MEP].throttle = max(0, Engines[MEP].throttle - 0.01)
     
-    if keys[pygame.K_h]:
-      Engines[HSG].throttle = min(1, Engines[HSG].throttle + 0.01)
+    if keys[pygame.K_e]:
+      Engines[HSG].throttle = min(-1, Engines[HSG].throttle + 0.01)
     else:
       Engines[HSG].throttle = max(0, Engines[HSG].throttle - 0.01)
 
@@ -447,8 +492,8 @@ def main():
     elif Engines[MCI].speed*60/(2*pi) < Engines[MCI].rev_act and Engines[MCI].rev_limit_activated: Engines[MCI].rev_limit_activated = False
 
     s = +1.0            # +1 external mesh, -1 internal/belt
-    k = 100           # angular spring (Nm/rad)
-    c = 1           # angular damper (Nms/rad)
+    k = 300           # angular spring (Nm/rad)
+    c = 5           # angular damper (Nms/rad)
 
     tot_error = 0
 
@@ -461,6 +506,10 @@ def main():
       tot_error += abs(C)
       engine.torque -= lam
       g1.torque += lam
+      
+    
+    k = 300           # angular spring (Nm/rad)
+    c = 2           # angular damper (Nms/rad)
       
 
     for index1, index2 in outside_conections:
@@ -547,7 +596,7 @@ def main():
       engine.apply_physics(dt)
 
     if su == substep:
-      print(f"Engine: {Engines[MCI].speed*60/(2*pi):.0f} rpm, Engine2 {Engines[MEP].speed*60/(2*pi):.0f} rpm, Engine3 {Engines[HSG].speed*60/(2*pi):.0f} rpm")
+      #print(f"Engine: {Engines[MCI].speed*60/(2*pi):.0f} rpm, Engine2 {Engines[MEP].speed*60/(2*pi):.0f} rpm, Engine3 {Engines[HSG].speed*60/(2*pi):.0f} rpm")
       su = 0
       #print("Total constraint error:", tot_error)
       screen.fill(BACKGROUND_COLOR)
@@ -589,6 +638,8 @@ def main():
         draw_gear(g, screen, module=1.8, scaling=scaling, pan_offset=pan_offset, axle_displacement=axle_displacement)
 
       draw_rpm_gauge(Engines[MCI], (260/2, 260/2), np.zeros((260, 260, 3), dtype=np.uint8))
+      
+      print(f"{Engines[MCI].angle}%")
         
       pygame.display.flip()
       
