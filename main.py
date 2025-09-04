@@ -46,12 +46,13 @@ class Engine:
     self.rev_limit_activated = 0
     self.conected_gear_index = 0
 
-  def apply_throttle(self, dt):
-    self.torque += torque_from_omega(self.speed)*(self.throttle if not self.rev_limit_activated else 0)
+  def apply_physics(self, dt):
+    self.torque += max(torque_from_omega(self.speed)*(self.throttle if not self.rev_limit_activated else 0), 0)
     tau_c = self.tau0 * copysign(1, self.speed) if self.speed != 0 else 0
     self.speed += (self.torque - tau_c - self.drag*self.speed) / self.inertia * dt
     if abs(self.speed) < 0.01: self.speed = 0
     self.torque = 0.0
+    self.angle += self.speed * dt
 
 class E_Engine:
   def __init__(self, inertia, name, max_amp=20):
@@ -60,8 +61,8 @@ class E_Engine:
     self.speed = 0
     self.angle = 0
     self.torque = 0
-    self.drag = 0.06
-    self.tau0 = 10
+    self.drag = 0.02
+    self.tau0 = 5
     self.offset = (0, 0)
     self.throttle = 0
     self.conected_gear_index = 0
@@ -76,12 +77,13 @@ class E_Engine:
     torque = power / omega
     return torque
   
-  def apply_throttle(self, dt):
+  def apply_physics(self, dt):
     self.torque += self.get_toque()
     tau_c = self.tau0 * copysign(1, self.speed) if self.speed != 0 else 0
     self.speed += (self.torque - tau_c - self.drag*self.speed) / self.inertia * dt
     if abs(self.speed) < 0.01: self.speed = 0
     self.torque = 0.0
+    self.angle += self.speed * dt
 
 
 Engines = [None]*3
@@ -91,8 +93,8 @@ displayed_numbers.reverse()
 MCI, HSG, MEP = 0, 1, 2
 
 Engines[MCI] = Engine(0.12, "1.6l Engine")
-Engines[HSG] = E_Engine(10, "HSG", max_amp=20)  # High Voltage Starter Generator
-Engines[MEP] = E_Engine(10, "MEP", max_amp=200)  # Main Electric Propulsion
+Engines[HSG] = E_Engine(0.06, "HSG", max_amp=20)  # High Voltage Starter Generator
+Engines[MEP] = E_Engine(0.06, "MEP", max_amp=200)  # Main Electric Propulsion
 
 def draw_rpm_gauge(e, pos, screen):
   # screen is expected to be a numpy array (cv2 image)
@@ -167,6 +169,7 @@ def load_gears_from_file(filename="gears.txt", Engines=[]):
           gear = Gear(teeth, inertia, item)
           gear.offset = (j * 150, i * 150)
           gears.append(gear)
+          print(f"Added gear: {item} with {teeth} teeth and inertia {inertia}")
 
     #add external conecting gears
     for i in range(len(result)-1):
@@ -178,7 +181,6 @@ def load_gears_from_file(filename="gears.txt", Engines=[]):
             g2_offset = (j * 150, (i+1) * 150)
             idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
             idx_g2 = next(index for index, g in enumerate(gears) if g.offset == g2_offset)
-            print(gears[idx_g1].name, gears[idx_g2].name)
             outside_conections.append((idx_g1, idx_g2))
 
     #add axle conecting gears
@@ -451,15 +453,14 @@ def main():
     tot_error = 0
 
     for engine in Engines:
-      if engine.name == "1.6l Engine":
-        g1 = gears[engine.conected_gear_index]
+      g1 = gears[engine.conected_gear_index]
 
-        C    = engine.angle - g1.angle
-        Cdot = engine.speed - g1.speed
-        lam  = k * C + c * Cdot
-        tot_error += abs(C)
-        engine.torque -= lam
-        g1.torque += lam
+      C    = engine.angle - g1.angle
+      Cdot = engine.speed - g1.speed
+      lam  = k * C + c * Cdot
+      tot_error += abs(C)
+      engine.torque -= lam
+      g1.torque += lam
       
 
     for index1, index2 in outside_conections:
@@ -543,7 +544,7 @@ def main():
     #Engines[MCI].torque = 0.0
 
     for engine in Engines:
-      engine.apply_throttle(dt)
+      engine.apply_physics(dt)
 
     if su == substep:
       print(f"Engine: {Engines[MCI].speed*60/(2*pi):.0f} rpm, Engine2 {Engines[MEP].speed*60/(2*pi):.0f} rpm, Engine3 {Engines[HSG].speed*60/(2*pi):.0f} rpm")
