@@ -1,0 +1,105 @@
+import math
+import pygame
+import numpy as np
+
+# ---------- Gear (side view) ----------
+
+class GearAnimation:
+    def __init__(self, Z=20, width_px = 40):
+        if Z <= 0:
+            raise ValueError("Z (number of teeth) must be greater than zero.")
+        self.Z = Z
+        self.width = width_px
+        self.module = 1.8  # Gear module or scaling factor
+    
+    def draw(g, surface, module=1.8, scaling=1.0, pan_offset=(0,0)):
+        x, y = g.offset
+        Z = g.teeth
+        angle = g.angle
+        R = Z * module*scaling
+        x = WIDNOW_WIDTH/2 + (x + pan_offset[0]) * scaling
+        y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
+
+        
+        
+        lateral_offset = pygame.mouse.get_pos()[0] / 10 - 30
+        lateral_offset = max(-35, min(35, lateral_offset))
+        print(lateral_offset)
+        tooth_height = int(-(40/R)*abs(lateral_offset/4)+40)
+
+        # Draw main body
+        pygame.draw.rect(surface, (100, 100, 100), (x-tooth_height/2, y - R, tooth_height, 2 * R))
+        pygame.draw.ellipse(surface, (100, 100, 100), (x - tooth_height/2 - lateral_offset/2 , y - R, lateral_offset, 2 * R), tooth_height)
+        pygame.draw.ellipse(surface, (100, 100, 100), (x + tooth_height/2 - lateral_offset/2 , y - R, lateral_offset, 2 * R), tooth_height)
+        
+        # Draw teeth as alternating rectangles on sides
+        tooth_width = (4 * R) / Z
+        for i in range(Z):
+            alpha = (i / Z) * 2 * math.pi + angle
+
+            on_downstroke = math.sin(alpha) > 0
+            negative_offset = False
+            if lateral_offset < 0: 
+                on_downstroke = not on_downstroke
+                negative_offset = True
+            
+
+            if on_downstroke:
+                tooth_x = x - tooth_height/2 + math.sin(alpha) * abs(lateral_offset/2)
+                tooth_y = y + math.cos(alpha) * R
+                #draw tooth
+                pygame.draw.rect(surface, (20, 20, 20), (tooth_x, tooth_y-tooth_width*abs(math.sin(alpha))/2, tooth_height, tooth_width*abs(math.sin(alpha))))
+                #draw a line at the center of the tooth
+                #pygame.draw.rect(surface, (255,0,0), (tooth_x, tooth_y, tooth_height, 1))
+            else:
+                tooth_x = x - tooth_height/2 + math.sin(alpha) * abs(lateral_offset/2)
+                tooth_y = y + math.cos(alpha) * R
+                #draw tooth
+                pygame.draw.rect(surface, (20, 20, 20), (tooth_x + (tooth_height if negative_offset else 0), tooth_y-tooth_width*abs(math.sin(alpha))/2, 3, tooth_width*abs(math.sin(alpha))))
+    
+
+
+# ---------- Demo ----------
+
+def main():
+    pygame.init()
+    W, H = 900, 560
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption("Side-view Helical Gear (angle-driven)")
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont("consolas", 18)
+
+    gear = GearAnimation(Z=20, width_px=40)
+    angle = 0.0
+    rpm = 20.0
+    running = True
+    auto = True
+
+    while running:
+        dt = clock.tick(60) / 1000.0
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running = False
+            elif e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_a: angle -= 0.12
+                if e.key == pygame.K_d: angle += 0.12
+                if e.key == pygame.K_s: rpm = 0.0
+                if e.key == pygame.K_RIGHT: rpm += 5.0
+                if e.key == pygame.K_LEFT: rpm = max(0.0, rpm - 5.0)
+                if e.key == pygame.K_1: gear = GearAnimation(Z=max(4, gear.Z-1), radius_px=gear.R, bore_px=gear.r_bore)
+                if e.key == pygame.K_2: gear = GearAnimation(Z=gear.Z+1, radius_px=gear.R, bore_px=gear.r_bore)
+
+        if auto:
+            angle += (rpm * 2 * math.pi / 60.0) * dt  # angle you can set externally
+
+        screen.fill((200, 200, 200))
+        gear.draw(screen, (W//2, H//2), angle)
+
+        info = f"Z={gear.Z}  rpm={rpm:.1f}  angle={angle% (2*math.pi):.2f} rad  [A/D spin] [←/→ rpm] [H helical] [1/2 Z]"
+        screen.blit(font.render(info, True, (230,230,230)), (16, 16))
+        pygame.display.flip()
+
+    pygame.quit()
+
+if __name__ == "__main__":
+    main()
