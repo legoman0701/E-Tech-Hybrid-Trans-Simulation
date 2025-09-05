@@ -17,7 +17,7 @@ class Gear:
     self.speed = 0
     self.angle = 0
     self.torque = 0
-    self.drag = 0.002
+    self.drag = 0.001
     self.offset = (0, 0)
 
 class DogClutch:
@@ -50,7 +50,7 @@ class Engine:
     self.torque += max(torque_from_omega(self.speed)*(self.throttle if not self.rev_limit_activated else 0), 0)
     tau_c = self.tau0 * copysign(1, self.speed) if self.speed != 0 else 0
     self.speed += (self.torque - tau_c - self.drag*self.speed) / self.inertia * dt
-    if abs(self.speed) < 0.01: self.speed = 0
+    if abs(self.speed) < 0.0001: self.speed = 0
     self.torque = 0.0
     self.angle += self.speed * dt
 
@@ -68,8 +68,8 @@ class E_Engine:
         self.speed = 0.0
         self.angle = 0.0
         self.torque = 0.0                 # external torque accumulator
-        self.drag = 0.02                  # viscous loss coeff [N·m·s/rad]
-        self.tau0 = 5.0                   # Coulomb friction [N·m]
+        self.drag = 0.005                  # viscous loss coeff [N·m·s/rad]
+        self.tau0 = 0
         self.offset = (0, 0)
         self.throttle = 0.0               # [-1..1]
         self.conected_gear_index = 0
@@ -138,8 +138,21 @@ displayed_numbers.reverse()
 MCI, HSG, MEP = 0, 1, 2
 
 Engines[MCI] = Engine(0.12, "1.6l Engine")
-Engines[HSG] = E_Engine(0.06, "HSG", max_amp=75)  # High Voltage Starter Generator
-Engines[MEP] = E_Engine(0.06, "MEP", max_amp=180)  # Main Electric Propulsion
+Engines[HSG] = E_Engine(0.02, "HSG", max_amp=75)  # High Voltage Starter Generator
+Engines[MEP] = E_Engine(0.02, "MEP", max_amp=180)  # Main Electric Propulsion
+
+def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=300, angle_offset=0.0):
+    Kinv = g_in.inertia + g_out.inertia
+    if Kinv == 0.0:
+        return 0.0
+    K = Kinv * gamma
+    C    = (1.0 * g_in.angle) + s * (ratio * g_out.angle)  - angle_offset
+    Cdot = (1.0 * g_in.speed) + s * (ratio * g_out.speed)
+    lam  = K * C + K * Cdot
+    
+    g_in.torque -= 1.0 * lam
+    g_out.torque -= s*ratio * lam
+
 
 def draw_rpm_gauge(e, pos, screen):
   # screen is expected to be a numpy array (cv2 image)
@@ -210,7 +223,7 @@ def load_gears_from_file(filename="gears.txt", Engines=[]):
       for j, item in enumerate(row):
         if check_if_gear(item):
           teeth = int(item[:-2])
-          inertia = teeth*teeth/100000
+          inertia = teeth*teeth/1000000
           gear = Gear(teeth, inertia, item)
           gear.offset = (j * 150, i * 150)
           gears.append(gear)
@@ -408,13 +421,9 @@ def main():
   #sim = CarSim(px_per_m=40.0)
 
   running = True
-  time.sleep(0.1)
-  su = 0
-  substep = 20
   while running:
     debut = time.time()
-    dt = min(1/300, dt)
-    su += 1
+    #dt = min(1/300, dt)
     
     for event in pygame.event.get():
       if event.type == pygame.QUIT:
@@ -486,87 +495,62 @@ def main():
       Engines[HSG].throttle = min(-1, Engines[HSG].throttle + 0.01)
     else:
       Engines[HSG].throttle = max(0, Engines[HSG].throttle - 0.01)
+    
+    if keys[pygame.K_s]:
+      Engines[MCI].torque += 10000
 
 
     if Engines[MCI].speed*60/(2*pi) > Engines[MCI].rev_cut: Engines[MCI].rev_limit_activated = True
     elif Engines[MCI].speed*60/(2*pi) < Engines[MCI].rev_act and Engines[MCI].rev_limit_activated: Engines[MCI].rev_limit_activated = False
 
     s = +1.0            # +1 external mesh, -1 internal/belt
-    k = 300           # angular spring (Nm/rad)
-    c = 5           # angular damper (Nms/rad)
-
-    tot_error = 0
-
-    for engine in Engines:
-      g1 = gears[engine.conected_gear_index]
-
-      C    = engine.angle - g1.angle
-      Cdot = engine.speed - g1.speed
-      lam  = k * C + c * Cdot
-      tot_error += abs(C)
-      engine.torque -= lam
-      g1.torque += lam
       
+    dt /= 300
+    for i in range(300):
+      for index1, index2 in outside_conections:
+        g_in = gears[index1]
+        g_out = gears[index2]
+
+        ratio = g_out.teeth/g_in.teeth
+        solve_gear_joint(g_in, g_out, ratio, s, dt)
+      
+      for index1, index2 in axle_conections:
+        g1 = gears[index1]
+        g2 = gears[index2]
+        solve_gear_joint(g1, g2, ratio=1.0, s=-s, dt=dt)
+        
+      for clutch in clutches:
+        if clutch.engaged == 0:
+          clutch.old_engaged = 0
+          continue
+        g1 = gears[clutch.left_gear_index]
+        g2 = gears[clutch.right_gear_index]
+        g3 = gears[clutch.right_most_axle_conected_gear_index]
+        ratio = 1.0
+
+        if clutch.engaged == -1:
+          if clutch.old_engaged != -1:
+            clutch.angle_offset = g1.angle - g3.angle
+            clutch.old_engaged = -1
+          solve_gear_joint(g1, g3, ratio=1.0, s=-s, dt=dt, angle_offset=clutch.angle_offset)
+        if clutch.engaged == +1:
+          if clutch.old_engaged != +1:
+            clutch.angle_offset = g2.angle - g3.angle
+            clutch.old_engaged = +1
+          solve_gear_joint(g2, g3, ratio=1.0, s=-s, dt=dt, angle_offset=clutch.angle_offset)
+      
+      for engine in Engines:
+        g1 = gears[engine.conected_gear_index]
+        solve_gear_joint(engine, g1, ratio=1.0, s=-s, dt=dt)
+      
+      for g in gears:
+        g.speed += ((g.torque) - g.drag * g.speed) / g.inertia * (dt)
+        g.angle += g.speed * (dt)
+        g.torque = 0.0
+      
+      for engine in Engines:
+        engine.apply_physics(dt)
     
-    k = 300           # angular spring (Nm/rad)
-    c = 2           # angular damper (Nms/rad)
-      
-
-    for index1, index2 in outside_conections:
-      g_in = gears[index1]
-      g_out = gears[index2]
-
-      ratio = g_out.teeth/g_in.teeth
-      C    = (1.0 * g_in.angle) + s * (ratio * g_out.angle)
-      Cdot = (1.0 * g_in.speed) + s * (ratio * g_out.speed)
-      lam  = k * C + c * Cdot
-      tot_error += abs(C)
-      g_in.torque -= 1.0 * lam
-      g_out.torque -= s*ratio * lam
-
-    for index1, index2 in axle_conections:
-      g1 = gears[index1]
-      g2 = gears[index2]
-
-      C    = g1.angle - g2.angle
-      Cdot = g1.speed - g2.speed
-      lam  = k * C + c * Cdot
-      tot_error += abs(C)
-      g1.torque -= lam
-      g2.torque += lam
-
-    for clutch in clutches:
-      if clutch.engaged == 0:
-        clutch.old_engaged = 0
-        continue
-      g1 = gears[clutch.left_gear_index]
-      g2 = gears[clutch.right_gear_index]
-      g3 = gears[clutch.right_most_axle_conected_gear_index]
-      ratio = 1.0
-
-      if clutch.engaged == -1:
-        if clutch.old_engaged != -1:
-          clutch.angle_offset = g1.angle - g3.angle
-          clutch.old_engaged = -1
-        ratio = 1.0
-        C    = (g1.angle) - (g3.angle) - clutch.angle_offset
-        Cdot = (g1.speed) - (g3.speed)
-        lam  = k * C + c * Cdot
-        tot_error += abs(C)
-        g1.torque -= lam
-        g3.torque += lam
-      if clutch.engaged == +1:
-        if clutch.old_engaged != +1:
-          clutch.angle_offset = g2.angle - g3.angle
-          clutch.old_engaged = +1
-        ratio = 1.0
-        C    = (g2.angle) - (g3.angle) - clutch.angle_offset
-        Cdot = (g2.speed) - (g3.speed)
-        lam  = k * C + c * Cdot
-        tot_error += abs(C)
-        g2.torque -= lam
-        g3.torque += lam
-
 
     g1 = gears[-1]
 
@@ -579,11 +563,6 @@ def main():
     #print(lam)
     #sim.set_front_hub_torque(torque_to_wheels)
 
-    for g in gears:
-      g.speed += ((g.torque) - g.drag * g.speed) / g.inertia * dt
-      g.angle += g.speed * dt
-      g.torque = 0.0
-
     #sim.step(dt)
     
     #Engines[MCI].torque += torque_from_omega(Engines[MCI].speed)*(Engines[MCI].throttle if not Engines[MCI].rev_limit_activated else 0)
@@ -592,65 +571,65 @@ def main():
     #if abs(Engines[MCI].speed) < 0.01: Engines[MCI].speed = 0
     #Engines[MCI].torque = 0.0
 
-    for engine in Engines:
-      engine.apply_physics(dt)
-
-    if su == substep:
-      #print(f"Engine: {Engines[MCI].speed*60/(2*pi):.0f} rpm, Engine2 {Engines[MEP].speed*60/(2*pi):.0f} rpm, Engine3 {Engines[HSG].speed*60/(2*pi):.0f} rpm")
-      su = 0
-      #print("Total constraint error:", tot_error)
-      screen.fill(BACKGROUND_COLOR)
-      
-      for i, row in enumerate(result):
-        for j, item in enumerate(row):
-          if item == '-':
+    #print(f"Engine: {Engines[MCI].speed*60/(2*pi):.0f} rpm, Engine2 {Engines[MEP].speed*60/(2*pi):.0f} rpm, Engine3 {Engines[HSG].speed*60/(2*pi):.0f} rpm")
+    #print("Total constraint error:", tot_error)
+    screen.fill(BACKGROUND_COLOR)
+    
+    for i, row in enumerate(result):
+      for j, item in enumerate(row):
+        if item == '-':
+          y = axle_displacement[i]
+          x = WINDOW_WIDTH/2 + (j * 150 + pan_offset[0]) * scaling
+          y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
+          pygame.draw.line(screen, (200,200,200), (x-150*scaling, y), (x+150*scaling, y), max(1, int(3*scaling)))
+    
+    for i, row in enumerate(result):
+      for j in range(len(row)-1):
+        item = row[j]
+        if check_if_gear(item):
+          if check_if_gear(row[j+1]):
             y = axle_displacement[i]
             x = WINDOW_WIDTH/2 + (j * 150 + pan_offset[0]) * scaling
             y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
-            pygame.draw.line(screen, (200,200,200), (x-150*scaling, y), (x+150*scaling, y), max(1, int(3*scaling)))
+            pygame.draw.line(screen, (200,200,200), (x, y), (x+150*scaling, y), max(1, int(3*scaling)))
+
+    for i, row in enumerate(result):
+      for j, item in enumerate(row):
+        if item == 'DC':
+          y = axle_displacement[i]
+          x = WINDOW_WIDTH/2 + (j * 150 + pan_offset[0]) * scaling
+          y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
+          pygame.draw.line(screen, (200,200,200), (x-150*scaling, y), (x+150*scaling, y), max(1, int(3*scaling)))
+
+          c_offset = (j * 150, i * 150)
+          idx_c = next(index for index, c in enumerate(clutches) if c.offset == c_offset)
+          clutch = clutches[idx_c]
+          engagement_offset = clutch.engaged * 30*scaling
+
+          pygame.draw.rect(screen, (150,50,50), (x-15*scaling + engagement_offset, y-15*scaling, 30*scaling, 30*scaling))      
+
+    for g in gears:
+      draw_gear(g, screen, module=1.8, scaling=scaling, pan_offset=pan_offset, axle_displacement=axle_displacement)
+
+    draw_rpm_gauge(Engines[MCI], (260/2, 260/2), np.zeros((260, 260, 3), dtype=np.uint8))
+    
+    #print(f"{Engines[MCI].angle}%")
       
-      for i, row in enumerate(result):
-        for j in range(len(row)-1):
-          item = row[j]
-          if check_if_gear(item):
-            if check_if_gear(row[j+1]):
-              y = axle_displacement[i]
-              x = WINDOW_WIDTH/2 + (j * 150 + pan_offset[0]) * scaling
-              y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
-              pygame.draw.line(screen, (200,200,200), (x, y), (x+150*scaling, y), max(1, int(3*scaling)))
-
-      for i, row in enumerate(result):
-        for j, item in enumerate(row):
-          if item == 'DC':
-            y = axle_displacement[i]
-            x = WINDOW_WIDTH/2 + (j * 150 + pan_offset[0]) * scaling
-            y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
-            pygame.draw.line(screen, (200,200,200), (x-150*scaling, y), (x+150*scaling, y), max(1, int(3*scaling)))
-
-            c_offset = (j * 150, i * 150)
-            idx_c = next(index for index, c in enumerate(clutches) if c.offset == c_offset)
-            clutch = clutches[idx_c]
-            engagement_offset = clutch.engaged * 30*scaling
-
-            pygame.draw.rect(screen, (150,50,50), (x-15*scaling + engagement_offset, y-15*scaling, 30*scaling, 30*scaling))      
-
-      for g in gears:
-        draw_gear(g, screen, module=1.8, scaling=scaling, pan_offset=pan_offset, axle_displacement=axle_displacement)
-
-      draw_rpm_gauge(Engines[MCI], (260/2, 260/2), np.zeros((260, 260, 3), dtype=np.uint8))
-      
-      print(f"{Engines[MCI].angle}%")
-        
-      pygame.display.flip()
-      
-      #frame = sim.render(1280, 720)
-      #cv2.imshow("CarSim", frame)
+    fps = 1.0 / dt if dt > 0 else 0.0
+    font = pygame.font.SysFont("Arial", 20)
+    text_surface = font.render(f"FPS: {fps:.2f}", True, (255, 255, 255))
+    screen.blit(text_surface, (10, 10))
+    
+    pygame.display.flip()
+    
+    #frame = sim.render(1280, 720)
+    #cv2.imshow("CarSim", frame)
       
     #while time.time()-debut < 1/sumulation_frequancy:{}
     
     
     dt = (time.time() - debut)
-    while dt < 1/2000:
+    while dt < 1/300:
       dt = (time.time() - debut)
   pygame.quit()
 
