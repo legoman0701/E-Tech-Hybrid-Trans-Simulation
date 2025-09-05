@@ -505,8 +505,9 @@ def main():
 
     s = +1.0            # +1 external mesh, -1 internal/belt
       
-    dt /= 300
-    for i in range(300):
+    dt = min(1/300, dt)
+    dt /= 100
+    for i in range(100):
       for index1, index2 in outside_conections:
         g_in = gears[index1]
         g_out = gears[index2]
@@ -550,20 +551,17 @@ def main():
       
       for engine in Engines:
         engine.apply_physics(dt)
+        
+      #g1 = gears[-1]
+      #C    = g1.angle - sim.front_wheel_angle
+      #Cdot = g1.speed - sim.front_wheel_omega
+      #lam  = 30 * C + 30 * Cdot
+      #g1.torque -= lam
+      #sim.set_front_hub_torque(lam)
+
+      #sim.step(dt)
+      #print(g1.speed)
     
-
-    g1 = gears[-1]
-
-    #C    = g1.angle - sim.front_wheel_angle
-    #Cdot = g1.speed - sim.front_wheel_omega
-    #lam  = c * Cdot * 2
-    #tot_error += abs(C)
-    #g1.torque -= lam
-    #torque_to_wheels = lam
-    #print(lam)
-    #sim.set_front_hub_torque(torque_to_wheels)
-
-    #sim.step(dt)
     
     #Engines[MCI].torque += torque_from_omega(Engines[MCI].speed)*(Engines[MCI].throttle if not Engines[MCI].rev_limit_activated else 0)
     #tau_c = Engines[MCI].tau0 * copysign(1, Engines[MCI].speed) if Engines[MCI].speed != 0 else 0
