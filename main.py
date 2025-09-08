@@ -141,17 +141,27 @@ Engines[MCI] = Engine(0.12, "1.6l Engine")
 Engines[HSG] = E_Engine(0.02, "HSG", max_amp=75)  # High Voltage Starter Generator
 Engines[MEP] = E_Engine(0.02, "MEP", max_amp=180)  # Main Electric Propulsion
 
-def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=300, angle_offset=0.0):
-    Kinv = g_in.inertia + g_out.inertia
-    if Kinv == 0.0:
-        return 0.0
-    K = Kinv * gamma
+def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=1, angle_offset=0.0):
     C    = (1.0 * g_in.angle) + s * (ratio * g_out.angle)  - angle_offset
-    Cdot = (1.0 * g_in.speed) + s * (ratio * g_out.speed)
-    lam  = K * C + K * Cdot
+    #Cdot = (1.0 * g_in.speed) + s * (ratio * g_out.speed)
+    Cdot = solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt)
+    lam  = gamma * C + Cdot
+    #lam  = Cdot
+    global error_tot
+    error_tot += abs(C)
     
     g_in.torque -= 1.0 * lam
     g_out.torque -= s*ratio * lam
+
+
+def solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt, strength=1.0):
+    I1, I2 = g_in.inertia, g_out.inertia
+    if dt <= 0 or I1 <= 0 or I2 <= 0: return 0.0
+    r = ratio
+    cd = g_in.speed + s*r*g_out.speed
+    inv = (1.0/I1) + (r*r)*(1.0/I2)
+    lam = strength*cd/(dt*inv)
+    return lam
 
 
 def draw_rpm_gauge(e, pos, screen):
@@ -407,7 +417,7 @@ is_panning = False
 last_mouse_pos = (0, 0)
 
 def main():
-  global scaling, pan_offset, is_panning, last_mouse_pos
+  global scaling, pan_offset, is_panning, last_mouse_pos, error_tot
   dt = 1/60
   debut = time.time()
   
@@ -505,8 +515,9 @@ def main():
 
     s = +1.0            # +1 external mesh, -1 internal/belt
       
-    dt = min(1/300, dt)
+    #dt = min(1/300, dt)
     dt /= 100
+    error_tot = 0
     for i in range(100):
       for index1, index2 in outside_conections:
         g_in = gears[index1]
@@ -572,6 +583,9 @@ def main():
     #print(f"Engine: {Engines[MCI].speed*60/(2*pi):.0f} rpm, Engine2 {Engines[MEP].speed*60/(2*pi):.0f} rpm, Engine3 {Engines[HSG].speed*60/(2*pi):.0f} rpm")
     #print("Total constraint error:", tot_error)
     screen.fill(BACKGROUND_COLOR)
+
+    error_tot/=100
+    print("Average constraint error:", error_tot)
     
     for i, row in enumerate(result):
       for j, item in enumerate(row):
@@ -632,4 +646,5 @@ def main():
   pygame.quit()
 
 if __name__ == "__main__":
+  error_tot = 0
   main()
