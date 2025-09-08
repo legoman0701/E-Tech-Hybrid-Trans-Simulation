@@ -137,7 +137,7 @@ displayed_numbers.reverse()
 
 MCI, HSG, MEP = 0, 1, 2
 
-Engines[MCI] = Engine(0.12, "1.6l Engine")
+Engines[MCI] = Engine(0.12, "1.6l Engine") # Main Combustion Engine
 Engines[HSG] = E_Engine(0.02, "HSG", max_amp=75)  # High Voltage Starter Generator
 Engines[MEP] = E_Engine(0.02, "MEP", max_amp=180)  # Main Electric Propulsion
 
@@ -164,7 +164,7 @@ def solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt, strength=0.5):
     return lam
 
 
-def draw_rpm_gauge(e, pos, screen):
+def draw_rpm_gauge(Engines, pos, screen):
   # screen is expected to be a numpy array (cv2 image)
   # pos is (cx, cy) center of the gauge
   cx, cy = pos
@@ -355,6 +355,7 @@ def load_gears_from_file(filename="gears.txt", Engines=[]):
           idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
           Engines[MEP].conected_gear_index = idx_g1
     
+    gears[-1].inertia = 10
     return gears, outside_conections, axle_conections, clutches, axle_displacement, result
 
 def draw_gear(g, surface, module=1.8, scaling=1.0, pan_offset=(0,0), axle_displacement=[]):
@@ -623,7 +624,7 @@ def main():
     for g in gears:
       draw_gear(g, screen, module=1.8, scaling=scaling, pan_offset=pan_offset, axle_displacement=axle_displacement)
 
-    draw_rpm_gauge(Engines[MCI], (260/2, 260/2), np.zeros((260, 260, 3), dtype=np.uint8))
+    draw_rpm_gauge(Engines, (260/2, 260/2), np.zeros((260, 260, 3), dtype=np.uint8))
     
     #print(f"{Engines[MCI].angle}%")
       
