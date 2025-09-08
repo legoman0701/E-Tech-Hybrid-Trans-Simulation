@@ -141,7 +141,7 @@ Engines[MCI] = Engine(0.12, "1.6l Engine")
 Engines[HSG] = E_Engine(0.02, "HSG", max_amp=75)  # High Voltage Starter Generator
 Engines[MEP] = E_Engine(0.02, "MEP", max_amp=180)  # Main Electric Propulsion
 
-def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=1, angle_offset=0.0):
+def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=100, angle_offset=0.0):
     C    = (1.0 * g_in.angle) + s * (ratio * g_out.angle)  - angle_offset
     #Cdot = (1.0 * g_in.speed) + s * (ratio * g_out.speed)
     Cdot = solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt)
@@ -154,7 +154,7 @@ def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=1, angle_offset=0.0):
     g_out.torque -= s*ratio * lam
 
 
-def solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt, strength=1.0):
+def solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt, strength=0.5):
     I1, I2 = g_in.inertia, g_out.inertia
     if dt <= 0 or I1 <= 0 or I2 <= 0: return 0.0
     r = ratio
