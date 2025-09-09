@@ -5,6 +5,7 @@ import multiprocessing
 import cv2
 import numpy as np
 from carsim_cv2 import CarSim
+from matplotlib import pyplot as plt
 
 WINDOW_WIDTH, WINDOW_HEIGHT = 800, 600
 BACKGROUND_COLOR = (30, 30, 30)
@@ -135,13 +136,16 @@ Engines = [None]*3
 displayed_numbers = [0, 1, 2, 3, 4, 5, 6]
 displayed_numbers.reverse()
 
+R2, R3, R4, MEP_EvA, MEP_EvB, EvA, EvB, FD = 1.125, 0.77688172, 2/3, 1.436206897, 0.761458333, 1.931034483, 1.023809524, 5
+Engines_ratios = [R2*FD, R3*FD, R4*FD, MEP_EvA*FD, MEP_EvB*FD]
+
 MCI, HSG, MEP = 0, 1, 2
 
 Engines[MCI] = Engine(0.12, "1.6l Engine") # Main Combustion Engine
 Engines[HSG] = E_Engine(0.02, "HSG", max_amp=75)  # High Voltage Starter Generator
 Engines[MEP] = E_Engine(0.02, "MEP", max_amp=180)  # Main Electric Propulsion
 
-def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=100, angle_offset=0.0):
+def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=500, angle_offset=0.0):
     C    = (1.0 * g_in.angle) + s * (ratio * g_out.angle)  - angle_offset
     #Cdot = (1.0 * g_in.speed) + s * (ratio * g_out.speed)
     Cdot = solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt)
@@ -153,8 +157,7 @@ def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=100, angle_offset=0.0):
     g_in.torque -= 1.0 * lam
     g_out.torque -= s*ratio * lam
 
-
-def solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt, strength=0.5):
+def solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt, strength=0.6):
     I1, I2 = g_in.inertia, g_out.inertia
     if dt <= 0 or I1 <= 0 or I2 <= 0: return 0.0
     r = ratio
@@ -162,7 +165,6 @@ def solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt, strength=0.5):
     inv = (1.0/I1) + (r*r)*(1.0/I2)
     lam = strength*cd/(dt*inv)
     return lam
-
 
 def draw_rpm_gauge(Engines, pos, screen):
   # screen is expected to be a numpy array (cv2 image)
@@ -355,7 +357,7 @@ def load_gears_from_file(filename="gears.txt", Engines=[]):
           idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
           Engines[MEP].conected_gear_index = idx_g1
     
-    gears[-1].inertia = 10
+    gears[-1].inertia = 50
     return gears, outside_conections, axle_conections, clutches, axle_displacement, result
 
 def draw_gear(g, surface, module=1.8, scaling=1.0, pan_offset=(0,0), axle_displacement=[]):
@@ -635,14 +637,9 @@ def main():
     
     pygame.display.flip()
     
-    #frame = sim.render(1280, 720)
-    #cv2.imshow("CarSim", frame)
-      
-    #while time.time()-debut < 1/sumulation_frequancy:{}
-    
     
     dt = (time.time() - debut)
-    while dt < 1/300:
+    while dt < 1/90:
       dt = (time.time() - debut)
   pygame.quit()
 
