@@ -5,7 +5,6 @@ import multiprocessing
 import cv2
 import numpy as np
 from carsim_cv2 import CarSim
-from matplotlib import pyplot as plt
 
 WINDOW_WIDTH, WINDOW_HEIGHT = 800, 600
 BACKGROUND_COLOR = (30, 30, 30)
@@ -145,11 +144,12 @@ Engines[MCI] = Engine(0.12, "1.6l Engine") # Main Combustion Engine
 Engines[HSG] = E_Engine(0.02, "HSG", max_amp=75)  # High Voltage Starter Generator
 Engines[MEP] = E_Engine(0.02, "MEP", max_amp=180)  # Main Electric Propulsion
 
-def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=500, angle_offset=0.0):
-    C    = (1.0 * g_in.angle) + s * (ratio * g_out.angle)  - angle_offset
+def solve_gear_joint(g_in, g_out, ratio, s, dt, angle_offset):
+    #C    = (1.0 * g_in.angle) + s * (ratio * g_out.angle)
+    C = solve_gear_c(g_in, g_out, ratio, s, dt, 30, angle_offset)
     #Cdot = (1.0 * g_in.speed) + s * (ratio * g_out.speed)
-    Cdot = solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt)
-    lam  = gamma * C + Cdot
+    Cdot = solve_gear_cdot(g_in, g_out, ratio, s, dt)
+    lam  =  C + Cdot
     #lam  = Cdot
     global error_tot
     error_tot += abs(C)
@@ -157,11 +157,23 @@ def solve_gear_joint(g_in, g_out, ratio, s, dt, gamma=500, angle_offset=0.0):
     g_in.torque -= 1.0 * lam
     g_out.torque -= s*ratio * lam
 
-def solve_gear_joint_kill_cdot(g_in, g_out, ratio, s, dt, strength=0.6):
+def solve_gear_cdot(g_in, g_out, ratio, s, dt, strength=0.7):
     I1, I2 = g_in.inertia, g_out.inertia
     if dt <= 0 or I1 <= 0 or I2 <= 0: return 0.0
     r = ratio
     cd = g_in.speed + s*r*g_out.speed
+    inv = (1.0/I1) + (r*r)*(1.0/I2)
+    lam = strength*cd/(dt*inv)
+    return lam
+
+def solve_gear_c(g_in, g_out, ratio, s, dt, strength, angle_offset):
+    I1, I2 = g_in.inertia, g_out.inertia
+    if angle_offset != 0:
+      print("niga")
+    if dt <= 0 or I1 <= 0 or I2 <= 0: return 0.0
+    r = ratio
+    cd_tmp = g_in.angle + (s*r*g_out.angle)
+    cd = g_in.angle + (s*r*g_out.angle) - angle_offset
     inv = (1.0/I1) + (r*r)*(1.0/I2)
     lam = strength*cd/(dt*inv)
     return lam
@@ -527,12 +539,12 @@ def main():
         g_out = gears[index2]
 
         ratio = g_out.teeth/g_in.teeth
-        solve_gear_joint(g_in, g_out, ratio, s, dt)
+        solve_gear_joint(g_in, g_out, ratio, s, dt, 0)
       
       for index1, index2 in axle_conections:
         g1 = gears[index1]
         g2 = gears[index2]
-        solve_gear_joint(g1, g2, ratio=1.0, s=-s, dt=dt)
+        solve_gear_joint(g1, g2, 1.0, -s, dt, 0)
         
       for clutch in clutches:
         if clutch.engaged == 0:
@@ -547,16 +559,16 @@ def main():
           if clutch.old_engaged != -1:
             clutch.angle_offset = g1.angle - g3.angle
             clutch.old_engaged = -1
-          solve_gear_joint(g1, g3, ratio=1.0, s=-s, dt=dt, angle_offset=clutch.angle_offset)
+          solve_gear_joint(g1, g3, 1.0, -s, dt, clutch.angle_offset)
         if clutch.engaged == +1:
           if clutch.old_engaged != +1:
             clutch.angle_offset = g2.angle - g3.angle
             clutch.old_engaged = +1
-          solve_gear_joint(g2, g3, ratio=1.0, s=-s, dt=dt, angle_offset=clutch.angle_offset)
+          solve_gear_joint(g2, g3, 1.0, -s, dt, clutch.angle_offset)
       
       for engine in Engines:
         g1 = gears[engine.conected_gear_index]
-        solve_gear_joint(engine, g1, ratio=1.0, s=-s, dt=dt)
+        solve_gear_joint(engine, g1, 1.0, -s, dt, 0)
       
       for g in gears:
         g.speed += ((g.torque) - g.drag * g.speed) / g.inertia * (dt)
