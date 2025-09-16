@@ -168,11 +168,8 @@ def solve_gear_cdot(g_in, g_out, ratio, s, dt, strength=0.7):
 
 def solve_gear_c(g_in, g_out, ratio, s, dt, strength, angle_offset):
     I1, I2 = g_in.inertia, g_out.inertia
-    if angle_offset != 0:
-      print("niga")
     if dt <= 0 or I1 <= 0 or I2 <= 0: return 0.0
     r = ratio
-    cd_tmp = g_in.angle + (s*r*g_out.angle)
     cd = g_in.angle + (s*r*g_out.angle) - angle_offset
     inv = (1.0/I1) + (r*r)*(1.0/I2)
     lam = strength*cd/(dt*inv)
@@ -448,7 +445,7 @@ def main():
   running = True
   while running:
     debut = time.time()
-    #dt = min(1/300, dt)
+    dt = min(1/90, dt)
     
     for event in pygame.event.get():
       if event.type == pygame.QUIT:
@@ -651,7 +648,7 @@ def main():
     
     
     dt = (time.time() - debut)
-    while dt < 1/90:
+    while dt <= 1/90:
       dt = (time.time() - debut)
   pygame.quit()
 
