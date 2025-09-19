@@ -1,531 +1,327 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-carsim_cv2.py
--------------
-Reusable 2D car simulator with real-ish physics units and OpenCV rendering.
+# carsim_cv2.py
+# 2D side-view car sim with two wheels, vertical spring-damper suspensions,
+# OpenCV rendering, and front-wheel torque I/O only.
+# Units: m, s, N, kg, rad.
 
-Public API (minimal I/O):
-- set_front_hub_torque(torque_nm): input torque applied at the *front* wheel hub (N·m). Positive drives forward.
-- step(dt) -> dict: advances physics by dt seconds and returns a dictionary with front-wheel telemetry:
-    {
-      "omega_rad_s": float,            # front wheel angular speed
-      "angle_rad": float,              # front wheel angle (wrapped)
-      "reaction_torque_nm": float,     # torque delivered *back* from wheel to hub (N·m), opposite sign to input when resisting
-      "slip_speed_mps": float,         # slip speed at contact (tangential)
-      "normal_force_N": float,         # normal force on front wheel
-      "tangent_force_N": float,        # friction force magnitude (signed along terrain tangent)
-      "speed_mps": float               # chassis x-velocity
-    }
-- render(width, height) -> np.ndarray (BGR): a frame suitable for cv2.imshow/write.
-
-Notes:
-- Units: m, s, kg, N, N·m, rad, rad/s.
-- Terrain is a smooth random sum of sines with a tiny base slope.
-- Suspension is a *prismatic joint* along chassis local -Y (perpendicular to body),
-  with a lateral link to prevent side "flop".
-- Ground contact uses a penalty normal model and Coulomb-capped viscous tangential friction.
-- Only control/telemetry is the torque to/from the *front* wheel hub.
-
-Author: ChatGPT (GPT-5 Thinking)
-"""
-from __future__ import annotations
+from dataclasses import dataclass
+import numpy as np
 import math
 import random
-from dataclasses import dataclass
-from typing import Tuple, Dict
-
-import numpy as np
 import cv2
 
-# ---------------------------
-# Colors (BGR for OpenCV)
-# ---------------------------
-WHITE = (240, 240, 240)
-BLACK = (10, 10, 10)
-GREY  = (120, 120, 130)
-BLUE  = (220, 140, 70)
-GREEN = (90, 180, 100)
-BROWN = (60, 80, 120)   # darker ground fill
-LINEG = (60, 180, 90)
-YELLOW= (60, 220, 240)
-BGCLR = (35, 30, 25)
-
-# ---------------------------
-# Helpers
-# ---------------------------
-def clamp(x, a, b):
-    return a if x < a else b if x > b else x
-
-def sgn(x: float) -> float:
-    if x > 0: return 1.0
-    if x < 0: return -1.0
-    return 0.0
-
-# ---------------------------
-# Terrain
-# ---------------------------
-class Terrain:
-    def __init__(self, seed=None):
-        if seed is None:
-            seed = random.randrange(1_000_000)
-        self.seed = seed
-        rnd = random.Random(seed)
-        self.components = []
-        specs = [
-            (80.0,  2.0),
-            (40.0,  1.2),
-            (20.0,  0.6),
-            (250.0, 4.0),
-        ]
-        for lam, amp in specs:
-            phase = rnd.uniform(0, 2*math.pi)
-            amp *= rnd.uniform(0.6, 1.4)
-            self.components.append((lam, amp, phase))
-        self.base_slope = rnd.uniform(-0.02, 0.02)
-        self.h0 = 5.0
-
-    def h(self, x):
-        y = self.h0 + self.base_slope * x
-        for lam, amp, phase in self.components:
-            y += amp * math.sin(2 * math.pi * x / lam + phase)
-        return y
-
-    def dhdx(self, x):
-        dy = self.base_slope
-        for lam, amp, phase in self.components:
-            dy += amp * (2 * math.pi / lam) * math.cos(2 * math.pi * x / lam + phase)
-        return dy
-
-    def normal(self, x):
-        slope = self.dhdx(x)
-        nx, ny = -slope, 1.0
-        inv = 1.0 / math.hypot(nx, ny)
-        return nx*inv, ny*inv
-
-    def tangent(self, x):
-        slope = self.dhdx(x)
-        tx, ty = 1.0, slope
-        inv = 1.0 / math.hypot(tx, ty)
-        return tx*inv, ty*inv
-
-# ---------------------------
-# Rigid bodies
-# ---------------------------
 @dataclass
-class RigidBody:
-    m: float
-    I: float
-    x: float
-    y: float
-    vx: float = 0.0
-    vy: float = 0.0
-    theta: float = 0.0
-    omega: float = 0.0
-    fx: float = 0.0
-    fy: float = 0.0
-    tau: float = 0.0
+class Params:
+    # Body
+    mass: float = 600.0          # kg
+    J: float = 550.0             # kg*m^2 body inertia about COM
+    width: float = 2.0           # m (visual)
+    height: float = 0.6          # m (visual)
+    wheelbase: float = 1.8       # m
+    anchor_y: float = -0.25      # m (anchors below COM in body frame)
 
-    def clear_forces(self):
-        self.fx = self.fy = self.tau = 0.0
+    # Wheels
+    wheel_radius: float = 0.32   # m
+    wheel_inertia: float = 1.4   # kg*m^2 (per wheel)
+    hub_viscous: float = 0.04    # N*m*s
 
-    def add_force(self, fx, fy, rx=0.0, ry=0.0):
-        self.fx += fx
-        self.fy += fy
-        self.tau += rx * fy - ry * fx
+    # Suspension (per wheel)
+    k: float = 25000.0           # N/m
+    c: float = 3200.0            # N*s/m
+    rest_len: float = 0.30       # m
+    max_travel: float = 0.25     # m
 
-    def integrate(self, dt):
-        # Semi-implicit Euler
-        self.vx += (self.fx / self.m) * dt
-        self.vy += (self.fy / self.m) * dt
-        self.x  += self.vx * dt
-        self.y  += self.vy * dt
+    # Contact/friction
+    mu: float = 1.3              # Coulomb coefficient
+    vs_slip: float = 0.6         # m/s, smooth slip scale (tanh)
+    c_rr: float = 0.015          # rolling resistance factor
 
-        self.omega += (self.tau / self.I) * dt
-        self.theta += self.omega * dt
+    # Environment
+    g: float = 9.81              # m/s^2
+    air_cdA: float = 0.55        # N/(m/s)^2 approx 0.5*rho*Cd*A
 
-@dataclass
-class Wheel(RigidBody):
-    r: float = 0.35
-    drive: bool = True
-    ang: float = 0.0
-    last_ground_torque_nm: float = 0.0
-    last_tangent_force_N: float = 0.0
-    last_normal_force_N: float = 0.0
-    last_slip_speed_mps: float = 0.0
-
-    def integrate(self, dt):
-        super().integrate(dt)
-        self.theta = math.fmod(self.theta + math.pi, 2*math.pi) - math.pi
-        self.ang = self.theta
-
-# ---------------------------
-# CarSim
-# ---------------------------
 class CarSim:
-    def __init__(self, px_per_m: float = 35.0):
-        self.PX_PER_M = px_per_m
-        self.WIDTH, self.HEIGHT = 1280, 720
+    """
+    Public API:
+      - CarSim(px_per_m=40.0)
+      - reset()                  # re-seeds terrain and resets state
+      - set_front_hub_torque(tau_nm: float)
+      - step(dt: float) -> dict  # returns front-wheel telemetry dict
+      - render(width_px: int, height_px: int) -> np.ndarray (BGR frame)
 
-        self.terrain = Terrain()
-        self.car = self._make_car()
+    Only I/O with the outside world:
+      - Input: set_front_hub_torque(...)
+      - Output: step(...) returns {'angular_pos_rad','angular_vel_rad_s','reaction_torque_nm'}
+                (front wheel only)
+    """
+    def __init__(self, px_per_m: float = 40.0):
+        self.px_per_m = float(px_per_m)
+        self.p = Params()
+        # Local anchors (rear=0, front=1)
+        hb = 0.5 * self.p.wheelbase
+        self.anchors_local = [(-hb, self.p.anchor_y), (+hb, self.p.anchor_y)]
+        self._seed_terrain()
+        self._reset_state()
 
-        # Camera, with no look-ahead (center on chassis x)
-        self.cam_x = self.car['chassis'].x
-        self.cam_y = self.car['chassis'].y
+    # ------------------ Public methods ------------------
 
-        # External input
-        self.input_torque_front_nm = 0.0
+    def reset(self):
+        self._seed_terrain()
+        self._reset_state()
 
-    # -----------------------
-    # Construction & helpers
-    # -----------------------
-    def _make_car(self):
-        # Chassis
-        chassis = RigidBody(m=420.0, I=100.0, x=5.0, y=self.terrain.h(5.0)+1.5, theta=0.0)
+    def set_front_hub_torque(self, tau_nm: float):
+        self._tau_in[1] = float(tau_nm)  # front wheel input torque only
 
-        # Wheels
-        wheel_mass = 22.0
-        wheel_r = 0.35
-        wheel_I = 0.5 * wheel_mass * wheel_r**2
-        wb = 1.9
-        wheel_front = Wheel(m=wheel_mass, I=wheel_I, x=chassis.x + wb/2, y=chassis.y - 0.5, r=wheel_r, drive=True)
-        wheel_rear  = Wheel(m=wheel_mass, I=wheel_I, x=chassis.x - wb/2, y=chassis.y - 0.5, r=wheel_r, drive=False)
+    def step(self, dt: float):
+        """Advance physics by dt (s). Return front hub telemetry dict."""
+        dt = float(dt)
+        # Optionally substep for stability if dt is big
+        max_sub = 1.0 / 300.0
+        nsub = max(1, int(math.ceil(dt / max_sub)))
+        h = dt / nsub
+        for _ in range(nsub):
+            self._substep(h)
 
-        # Place wheels on terrain
-        wheel_front.y = self.terrain.h(wheel_front.x) + wheel_front.r + 0.05
-        wheel_rear.y  = self.terrain.h(wheel_rear.x)  + wheel_rear.r  + 0.05
-
-        # Suspension model params
-        k_s = 18000.0; c_s = 2200.0; rest_len = 0.35
-        k_link = 90000.0; c_link = 3000.0
-        k_gn = 220000.0; c_gn = 1400.0; mu = 1.0; k_tan = 3600.0; Crr = 0.02
-
-        off_y = -0.1
-        mount_front_local = ( +wb/2, -0.2 + off_y )
-        mount_rear_local  = ( -wb/2, -0.2 + off_y )
-
-        rho = 1.225; CdA = 0.7
-
+        # Return FRONT wheel telemetry only
+        i = 1  # front index
         return {
-            'chassis': chassis,
-            'wf': wheel_front,
-            'wr': wheel_rear,
-            'wb': wb,
-            'k_s': k_s, 'c_s': c_s, 'rest_len': rest_len,
-            'k_link': k_link, 'c_link': c_link,
-            'k_gn': k_gn, 'c_gn': c_gn, 'mu': mu, 'k_tan': k_tan, 'Crr': Crr,
-            'mount_front_local': mount_front_local,
-            'mount_rear_local': mount_rear_local,
-            'rho': rho, 'CdA': CdA
+            "angular_pos_rad": self.wheel_ang[i],
+            "angular_vel_rad_s": self.wheel_omg[i],
+            "reaction_torque_nm": self._tau_out[i],
         }
 
-    def chassis_local_to_world(self, lx, ly):
-        c = self.car['chassis']
-        ct = math.cos(c.theta); st = math.sin(c.theta)
-        return c.x + ct*lx - st*ly, c.y + st*lx + ct*ly
+    def render(self, width_px: int, height_px: int) -> np.ndarray:
+        """Return an OpenCV BGR frame (all drawing is done here)."""
+        W, H = int(width_px), int(height_px)
+        img = np.zeros((H, W, 3), dtype=np.uint8)
+        img[:] = (18, 18, 22)
 
-    # -----------------------
-    # External API
-    # -----------------------
-    def set_front_hub_torque(self, torque_nm: float):
-        """Input torque applied at front hub (N·m). Positive drives forward."""
-        self.input_torque_front_nm = float(torque_nm)
+        # View transform: keep the car horizontally centered; vertically anchor terrain under COM.
+        scale = self.px_per_m
+        x_cam = self.x
+        y0 = self._terrain(self.x)  # baseline terrain height under car
+        base_px = int(H * 0.75)
 
-    
-    # -----------
-    # Properties / getters for external access (read-anytime)
-    # -----------
-    @property
-    def front_wheel_angle(self) -> float:
-        return self.car['wf'].ang
+        def w2s(wx, wy):
+            sx = int(W * 0.5 + (wx - x_cam) * scale)
+            sy = int(base_px - (wy - y0) * scale)
+            return sx, sy
 
-    @property
-    def front_wheel_omega(self) -> float:
-        return self.car['wf'].omega
+        # Draw terrain polyline across screen
+        xs = np.linspace(-W * 0.5 / scale + x_cam, W * 0.5 / scale + x_cam, num=800)
+        ys = np.array([self._terrain(x) for x in xs])
+        poly = np.array([w2s(x, y) for x, y in zip(xs, ys)], dtype=np.int32)
+        cv2.polylines(img, [poly], isClosed=False, color=(70, 70, 70), thickness=2)
 
-    @property
-    def front_reaction_torque(self) -> float:
-        return -self.car['wf'].last_ground_torque_nm
-
-    @property
-    def front_input_torque(self) -> float:
-        return self.input_torque_front_nm
-
-    def get_front_wheel_state(self):
-        wf = self.car['wf']
-        return {
-            'angle_rad': wf.ang,
-            'omega_rad_s': wf.omega,
-            'reaction_torque_nm': -wf.last_ground_torque_nm
-        }
-    def step(self, dt: float) -> Dict[str, float]:
-        """Advance physics by dt seconds and return front wheel telemetry."""
-        car = self.car
-        ch = car['chassis']; wf = car['wf']; wr = car['wr']
-
-        # Clear
-        ch.clear_forces(); wf.clear_forces(); wr.clear_forces()
-        wf.last_ground_torque_nm = 0.0
-        wf.last_tangent_force_N  = 0.0
-        wf.last_normal_force_N   = 0.0
-        wf.last_slip_speed_mps   = 0.0
-        wr.last_ground_torque_nm = 0.0
-
-        # Gravity
-        g = 9.81
-        ch.add_force(0.0, -ch.m * g)
-        wf.add_force(0.0, -wf.m * g)
-        wr.add_force(0.0, -wr.m * g)
-
-        # Suspension forces (prismatic along chassis -Y with lateral link)
-        self._suspension_forces(wf, car['mount_front_local'])
-        self._suspension_forces(wr, car['mount_rear_local'])
-
-        # Ground contact
-        self._ground_contact(wf)
-        self._ground_contact(wr)
-
-        # Aero drag on chassis (quadratic)
-        vx = ch.vx; v = abs(vx)
-        Fd = -0.5 * car['rho'] * car['CdA'] * v * vx
-        ch.add_force(Fd, 0.0)
-
-        # Apply external hub torque to FRONT wheel only
-        wf.tau += self.input_torque_front_nm
-
-        # Integrate
-        ch.integrate(dt)
-        wf.integrate(dt)
-        wr.integrate(dt)
-
-        # Camera follow (no look-ahead)
-        target_x = ch.x
-        target_y = max(self.terrain.h(ch.x) + 1.2, ch.y)
-        lerp = 0.15
-        self.cam_x += (target_x - self.cam_x) * lerp
-        self.cam_y += (target_y - self.cam_y) * lerp
-
-        # Reaction torque at hub: equal-and-opposite of ground torque acting on the wheel
-        reaction_nm = -wf.last_ground_torque_nm
-
-        return {
-            "omega_rad_s": wf.omega,
-            "angle_rad": wf.ang,
-            "reaction_torque_nm": reaction_nm,
-            "slip_speed_mps": wf.last_slip_speed_mps,
-            "normal_force_N": wf.last_normal_force_N,
-            "tangent_force_N": wf.last_tangent_force_N,
-            "speed_mps": ch.vx
-        }
-
-    def render(self, width: int = 1280, height: int = 720) -> np.ndarray:
-        """Return a BGR frame for OpenCV display/writing."""
-        self.WIDTH, self.HEIGHT = width, height
-        img = np.zeros((height, width, 3), dtype=np.uint8)
-        img[:] = BGCLR
-
-        # Terrain
+        # Draw body as a rotated rectangle
+        body_c = (self.x, self.y)
+        w_m, h_m = self.p.width, self.p.height
+        hw, hh = 0.5 * w_m, 0.5 * h_m
+        c, s = math.cos(self.theta), math.sin(self.theta)
+        corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
         pts = []
-        x0 = self.cam_x - width / (2*self.PX_PER_M) - 2.0
-        x1 = self.cam_x + width / (2*self.PX_PER_M) + 2.0
-        step = 0.5
-        x = x0
-        while x <= x1:
-            y = self.terrain.h(x)
-            px, py = self.world_to_screen(x, y)
-            pts.append([px, py])
-            x += step
-        if len(pts) >= 2:
-            poly = np.array([[pts[0][0], height-1]] + pts + [[pts[-1][0], height-1]], dtype=np.int32)
-            cv2.fillPoly(img, [poly], BROWN)
-            cv2.polylines(img, [np.int32(pts)], False, LINEG, 2, lineType=cv2.LINE_AA)
+        for lx, ly in corners:
+            wx = body_c[0] + (c * lx - s * ly)
+            wy = body_c[1] + (s * lx + c * ly)
+            pts.append(w2s(wx, wy))
+        cv2.polylines(img, [np.array(pts, np.int32)], True, (200, 200, 255), 3)
 
-        # Car
-        self._draw_wheel(img, self.car['wr'])
-        self._draw_wheel(img, self.car['wf'])
-        self._draw_chassis_and_springs(img)
+        # Wheels and suspensions
+        wheel_pos = self._wheel_draw_positions()
+        for i, (wx, wy) in enumerate(wheel_pos):
+            sx, sy = w2s(wx, wy)
+            rpx = int(self.p.wheel_radius * scale)
+            cv2.circle(img, (sx, sy), rpx, (230, 230, 230), 2)
 
-        # HUD
-        ch = self.car['chassis']; wf = self.car['wf']
-        v = ch.vx; vkmh = v*3.6
-        slope_deg = math.degrees(math.atan(self.terrain.dhdx(ch.x)))
+            # Spoke for rotation
+            spoke_x = wx + self.p.wheel_radius * math.cos(self.wheel_ang[i])
+            spoke_y = wy + self.p.wheel_radius * math.sin(self.wheel_ang[i])
+            cv2.line(img, (sx, sy), w2s(spoke_x, spoke_y), (230, 230, 230), 2)
+
+            # Suspension line (anchor to center)
+            ax, ay = self._point_world(self.anchors_local[i])
+            cv2.line(img, w2s(ax, ay), (sx, sy), (140, 160, 255), 2)
+
+        # HUD (front wheel telemetry only)
+        tele = {
+            "vx": self.vx,
+            "theta_deg": math.degrees(self.theta),
+            "front_ang": self.wheel_ang[1],
+            "front_omg": self.wheel_omg[1],
+            "front_tau_out": self._tau_out[1],
+            "tau_in": self._tau_in[1],
+        }
         hud = [
-            f"Speed: {v:6.2f} m/s  ({vkmh:6.1f} km/h)",
-            f"Front:  w={wf.omega:7.2f} rad/s  T_in={self.input_torque_front_nm:6.1f} N·m  T_rxn={-wf.last_ground_torque_nm:6.1f} N·m",
-            f"Slip: {wf.last_slip_speed_mps:+.2f} m/s   Fn: {wf.last_normal_force_N:7.1f} N   Ft: {wf.last_tangent_force_N:7.1f} N",
-            f"Slope: {slope_deg:+.1f}°"
+            f"vx={tele['vx']:+6.2f} m/s   pitch={tele['theta_deg']:+6.2f} deg",
+            f"Front: ang={tele['front_ang']:+6.3f} rad  omg={tele['front_omg']:+7.3f} rad/s",
+            f"tau_in={tele['tau_in']:+7.1f} N·m   tau_out={tele['front_tau_out']:+7.1f} N·m",
         ]
-        y = 20
-        for t in hud:
-            cv2.putText(img, t, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1, cv2.LINE_AA)
-            y += 20
+        y = 18
+        for line in hud:
+            cv2.putText(img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
+            y += 18
 
         return img
 
-    # -----------------------
-    # Internals
-    # -----------------------
-    def world_to_screen(self, x, y):
-        sx = int((x - self.cam_x) * self.PX_PER_M + self.WIDTH // 2)
-        sy = int(self.HEIGHT // 2 - (y - self.cam_y) * self.PX_PER_M)
-        return sx, sy
+    # ------------------ Internal: physics & helpers ------------------
 
-    def _draw_wheel(self, img, wheel: Wheel):
-        cx, cy = self.world_to_screen(wheel.x, wheel.y)
-        rpx = max(2, int(wheel.r * self.PX_PER_M))
-        cv2.circle(img, (cx, cy), rpx+2, BLACK, 2, lineType=cv2.LINE_AA)
-        cv2.circle(img, (cx, cy), rpx, GREY, 2, lineType=cv2.LINE_AA)
-        ex = int(cx + math.cos(-wheel.ang) * rpx)
-        ey = int(cy - math.sin(-wheel.ang) * rpx)
-        cv2.line(img, (cx, cy), (ex, ey), BLUE, 2, lineType=cv2.LINE_AA)
+    def _reset_state(self):
+        p = self.p
+        self.x = 0.0
+        # Start a bit above ground so suspensions settle
+        self.y = self._terrain(0.0) + p.wheel_radius + p.rest_len + 0.12
+        self.vx = 0.0
+        self.vy = 0.0
+        self.theta = 0.0
+        self.omega = 0.0
 
-    def _draw_chassis_and_springs(self, img):
-        ch = self.car['chassis']
-        W = 2.0; H = 0.4
-        corners_local = [(-W/2, -H/2), (W/2, -H/2), (W/2, H/2), (-W/2, H/2)]
-        pts = []
-        for lx, ly in corners_local:
-            x, y = self.chassis_local_to_world(lx, ly)
-            pts.append(self.world_to_screen(x, y))
-        poly = np.array(pts, dtype=np.int32)
-        cv2.fillConvexPoly(img, poly, GREY)
-        cv2.polylines(img, [poly], True, BLACK, 2, lineType=cv2.LINE_AA)
+        self.wheel_ang = [0.0, 0.0]
+        self.wheel_omg = [0.0, 0.0]
+        self._tau_in = [0.0, 0.0]     # only index 1 (front) is used
+        self._tau_out = [0.0, 0.0]    # reaction torque (hub feels)
 
-        # springs
-        mx_f, my_f = self.chassis_local_to_world(*self.car['mount_front_local'])
-        mx_r, my_r = self.chassis_local_to_world(*self.car['mount_rear_local'])
-        sxf, syf = self.world_to_screen(mx_f, my_f)
-        sxr, syr = self.world_to_screen(mx_r, my_r)
-        cxf, cyf = self.world_to_screen(self.car['wf'].x, self.car['wf'].y)
-        cxr, cyr = self.world_to_screen(self.car['wr'].x, self.car['wr'].y)
-        cv2.line(img, (sxf, syf), (cxf, cyf), YELLOW, 2, lineType=cv2.LINE_AA)
-        cv2.line(img, (sxr, syr), (cxr, cyr), YELLOW, 2, lineType=cv2.LINE_AA)
+    def _rot_body_to_world(self, lx: float, ly: float):
+        c, s = math.cos(self.theta), math.sin(self.theta)
+        return (c * lx - s * ly, s * lx + c * ly)
 
-    def _suspension_forces(self, wheel: Wheel, mount_local: Tuple[float, float]):
-        car = self.car
-        ch = car['chassis']
+    def _point_world(self, local_pt):
+        rx, ry = self._rot_body_to_world(local_pt[0], local_pt[1])
+        return (self.x + rx, self.y + ry)
 
-        mx, my = self.chassis_local_to_world(*mount_local)
+    def _point_world_vel(self, local_pt):
+        rx, ry = self._rot_body_to_world(local_pt[0], local_pt[1])
+        return (self.vx - self.omega * ry, self.vy + self.omega * rx)
 
-        ct = math.cos(ch.theta); st = math.sin(ch.theta)
-        # local axes
-        a_down_x, a_down_y = ( st, -ct)   # body local (0,-1)
-        a_lat_x,  a_lat_y  = ( ct,  st)   # body local (+1,0)
+    def _terrain(self, x: float) -> float:
+        # Smooth wavy terrain, reproducible by self._terrain_seed
+        a1, f1, ph1, a2, f2, ph2, bias = self._terrain_seed
+        return (a1 * math.sin(f1 * (x + ph1)) +
+                a2 * math.sin(f2 * (x + ph2)) + bias)
 
-        # vector mount->wheel
-        dx = wheel.x - mx; dy = wheel.y - my
-        L_axial = dx * a_down_x + dy * a_down_y
-        L_lat   = dx * a_lat_x  + dy * a_lat_y
+    def _seed_terrain(self):
+        rng = random.Random()
+        seed = random.randint(0, 10_000_000)
+        rng.seed(seed)
+        a1 = rng.uniform(0.00, 0.10)   # m
+        a2 = rng.uniform(0.00, 0.06)   # m
+        f1 = rng.uniform(0.15, 0.35)   # rad/m
+        f2 = rng.uniform(0.60, 1.10)   # rad/m
+        ph1 = rng.uniform(-5.0, 5.0)
+        ph2 = rng.uniform(-5.0, 5.0)
+        bias = rng.uniform(-0.01, 0.01)
+        self._terrain_seed = (a1, f1, ph1, a2, f2, ph2, bias)
 
-        # mount point velocity
-        rx = mx - ch.x; ry = my - ch.y
-        vcx = ch.vx + (-ch.omega * ry)
-        vcy = ch.vy + ( ch.omega * rx)
+    def _wheel_draw_positions(self):
+        """Wheel center positions used for drawing (accounts for contact vs air)."""
+        pos = []
+        for local in self.anchors_local:
+            ax, ay = self._point_world(local)
+            ground_y = self._terrain(ax)
+            raw_gap = ay - ground_y
+            compression = (self.p.rest_len + self.p.wheel_radius) - raw_gap
+            compression = max(0.0, min(self.p.max_travel, compression))
+            in_contact = compression > 1e-7
+            if in_contact:
+                wy = ground_y + self.p.wheel_radius
+            else:
+                wy = ay - self.p.rest_len
+            pos.append((ax, wy))
+        return pos
 
-        vrx = wheel.vx - vcx; vry = wheel.vy - vcy
-        v_rel_ax = vrx * a_down_x + vry * a_down_y
-        v_rel_lt = vrx * a_lat_x  + vry * a_lat_y
+    def _substep(self, dt: float):
+        p = self.p
+        Fx, Fy, Tau = 0.0, 0.0, 0.0
 
-        # spring-damper axial
-        x_comp = car['rest_len'] - L_axial
-        Fax = car['k_s'] * x_comp - car['c_s'] * v_rel_ax
+        # Aero drag (quadratic)
+        speed = math.hypot(self.vx, self.vy)
+        if speed > 1e-6:
+            drag = p.air_cdA * speed * speed
+            Fx -= drag * (self.vx / speed)
+            Fy -= drag * (self.vy / speed)
 
-        # lateral link
-        Flat = - car['k_link'] * L_lat - car['c_link'] * v_rel_lt
+        # Per wheel: suspension + longitudinal friction, wheel dynamics
+        for i, local in enumerate(self.anchors_local):
+            ax, ay = self._point_world(local)
+            avx, avy = self._point_world_vel(local)
 
-        fx = Fax * a_down_x + Flat * a_lat_x
-        fy = Fax * a_down_y + Flat * a_lat_y
+            # Terrain contact along vertical ray
+            gy = self._terrain(ax)
+            raw_gap = ay - gy
+            compression = (p.rest_len + p.wheel_radius) - raw_gap
+            compression = max(0.0, min(p.max_travel, compression))
 
-        wheel.add_force(+fx, +fy)
-        ch.add_force(-fx, -fy, rx, ry)
+            # Compression velocity approximation: anchor moving down increases compression
+            comp_vel = -avy
 
-    def _ground_contact(self, wheel: Wheel):
-        car = self.car
-        terr = self.terrain
-        hx = terr.h(wheel.x)
-        nx, ny = terr.normal(wheel.x)
-        tx, ty = terr.tangent(wheel.x)
+            Fn = p.k * compression + p.c * comp_vel
+            if Fn < 0.0:
+                Fn = 0.0
 
-        depth = (hx + wheel.r) - wheel.y
-        if depth > 0.0:
-            v_rel_n = wheel.vx * nx + wheel.vy * ny
-            Fn = car['k_gn'] * depth - car['c_gn'] * v_rel_n
-            if Fn < 0.0: Fn = 0.0
-            wheel.add_force(Fn * nx, Fn * ny)
-            wheel.last_normal_force_N = Fn
+            in_contact = compression > 1e-7
+            fx_i, fy_i = 0.0, 0.0
 
-            # tangential slip speed at contact
-            v_t = wheel.vx * tx + wheel.vy * ty - wheel.omega * wheel.r
-            Ft_visc = - car['k_tan'] * v_t
-            Ft_max = car['mu'] * Fn
-            Ft = clamp(Ft_visc, -Ft_max, +Ft_max)
+            if in_contact and Fn > 0.0:
+                # Upward normal
+                fy_i += Fn
 
-            wheel.add_force(Ft * tx, Ft * ty)
-            wheel.tau += -Ft * wheel.r
+                # Longitudinal slip/friction (horizontal only; ignore slope for simplicity)
+                v_long = avx
+                surf = self.wheel_omg[i] * p.wheel_radius
+                slip = v_long - surf
 
-            # record telemetry
-            wheel.last_tangent_force_N = Ft
-            wheel.last_slip_speed_mps  = v_t
+                F_c = p.mu * Fn
+                F_long = -F_c * math.tanh(slip / max(1e-6, p.vs_slip))
 
-            # rolling resistance as additional force at COM
-            v_long = wheel.vx * tx + wheel.vy * ty
-            Fr_roll = - car['Crr'] * Fn * sgn(v_long)
-            wheel.add_force(Fr_roll * tx, Fr_roll * ty)
+                # Rolling resistance opposes motion
+                if abs(v_long) > 1e-3:
+                    F_rr = -p.c_rr * Fn * math.copysign(1.0, v_long)
+                else:
+                    F_rr = 0.0
 
-            # Track ground torque (from friction only) acting on wheel
-            wheel.last_ground_torque_nm += -Ft * wheel.r
+                fx_i += (F_long + F_rr)
 
-    # -----------------------
-    # Reset
-    # -----------------------
-    def reset(self, seed=None):
-        self.terrain = Terrain(seed=seed)
-        self.car = self._make_car()
-        self.cam_x = self.car['chassis'].x
-        self.cam_y = self.car['chassis'].y
-        self.input_torque_front_nm = 0.0
-        return True
+                # Wheel dynamics
+                tau_contact = -fx_i * p.wheel_radius
+                tau_visc = p.hub_viscous * self.wheel_omg[i]
+                tau_net = self._tau_in[i] + tau_contact - tau_visc
+                alpha = tau_net / p.wheel_inertia
+                self.wheel_omg[i] += alpha * dt
+                self.wheel_ang[i] = (self.wheel_ang[i] + self.wheel_omg[i] * dt) % (2 * math.pi)
 
+                # Report reaction torque felt at hub (contact + viscous, opposite sign of applied)
+                self._tau_out[i] = -(tau_contact + tau_visc)
+            else:
+                # Free spin (no ground torque)
+                tau_net = self._tau_in[i] - p.hub_viscous * self.wheel_omg[i]
+                alpha = tau_net / p.wheel_inertia
+                self.wheel_omg[i] += alpha * dt
+                self.wheel_ang[i] = (self.wheel_ang[i] + self.wheel_omg[i] * dt) % (2 * math.pi)
+                self._tau_out[i] = -( -p.hub_viscous * self.wheel_omg[i] )
 
-# ---------------------------
-# Minimal demo (optional)
-# ---------------------------
-def _demo():
-    sim = CarSim(px_per_m=40.0)
-    t_in = 0.0
-    dt = 1.0/240.0
-    clock_hz = 120  # render rate
-    frame_interval = int(round(1_000 / clock_hz))
+            # Apply to body at anchor
+            Fx += fx_i
+            Fy += fy_i
+            rx, ry = self._rot_body_to_world(local[0], local[1])
+            Tau += rx * fy_i - ry * fx_i
 
-    print("Demo controls (OpenCV window focused):")
-    print("  D: +torque,  A: -torque,  S: zero torque,  R: reset terrain,  Q/Esc: quit")
-    while True:
-        # simple keyboard-based torque
-        key = cv2.waitKey(frame_interval) & 0xFF
-        if key in (ord('q'), 27):
-            break
-        elif key == ord('d'):
-            t_in += 20.0
-        elif key == ord('a'):
-            t_in -= 20.0
-        elif key == ord('s'):
-            t_in = 0.0
-        elif key == ord('r'):
-            sim.reset()
+        # Gravity
+        Fy -= p.mass * p.g
 
-        # physics step(s)
-        # integrate multiple substeps per render for stability
-        sub = 2
-        for _ in range(sub):
-            sim.set_front_hub_torque(t_in)
-            telem = sim.step(dt)
+        # Integrate body (semi-implicit Euler)
+        ax = Fx / p.mass
+        ay = Fy / p.mass
+        ang_acc = Tau / p.J
 
-        frame = sim.render(1280, 720)
-        cv2.imshow("CarSim OpenCV (torque control)", frame)
+        self.vx += ax * dt
+        self.vy += ay * dt
+        self.omega += ang_acc * dt
 
-    cv2.destroyAllWindows()
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        self.theta += self.omega * dt
 
-
-if __name__ == "__main__":
-    _demo()
+        # Simple floor safety: don't let COM fall far below terrain beneath (rare)
+        min_y = self._terrain(self.x) + 0.05
+        if self.y < min_y:
+            self.y = min_y
+            if self.vy < 0.0:
+                self.vy = 0.0

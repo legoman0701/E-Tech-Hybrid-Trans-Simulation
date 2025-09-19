@@ -136,7 +136,7 @@ displayed_numbers = [0, 1, 2, 3, 4, 5, 6]
 displayed_numbers.reverse()
 
 R2, R3, R4, MEP_EvA, MEP_EvB, EvA, EvB, FD = 1.125, 0.77688172, 2/3, 1.436206897, 0.761458333, 1.931034483, 1.023809524, 5
-Engines_ratios = [R2*FD, R3*FD, R4*FD, MEP_EvA*FD, MEP_EvB*FD]
+Engines_ratios = [R2*FD, R3*FD, R4*FD]
 
 MCI, HSG, MEP = 0, 1, 2
 
@@ -574,13 +574,6 @@ def main():
       
       for engine in Engines:
         engine.apply_physics(dt)
-        
-      #g1 = gears[-1]
-      #C    = g1.angle - sim.front_wheel_angle
-      #Cdot = g1.speed - sim.front_wheel_omega
-      #lam  = 30 * C + 30 * Cdot
-      #g1.torque -= lam
-      #sim.set_front_hub_torque(lam)
 
       #sim.step(dt)
       #print(g1.speed)
@@ -597,7 +590,7 @@ def main():
     screen.fill(BACKGROUND_COLOR)
 
     error_tot/=100
-    print("Average constraint error:", error_tot)
+    #print("Average constraint error:", error_tot)
     
     for i, row in enumerate(result):
       for j, item in enumerate(row):
@@ -646,6 +639,9 @@ def main():
     
     pygame.display.flip()
     
+    
+    #frame = sim.render(600, 600)
+    #cv2.imshow("CarSim OpenCV — torque I/O only", frame)
     
     dt = (time.time() - debut)
     while dt <= 1/90:
