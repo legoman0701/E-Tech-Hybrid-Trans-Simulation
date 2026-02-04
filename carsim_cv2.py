@@ -24,18 +24,15 @@ class Params:
     wheel_inertia: float = 1.4   # kg*m^2 (per wheel)
     hub_viscous: float = 0.04    # N*m*s
 
-    # Suspension (per wheel)
     k: float = 25000.0           # N/m
     c: float = 3200.0            # N*s/m
     rest_len: float = 0.30       # m
     max_travel: float = 0.25     # m
 
-    # Contact/friction
     mu: float = 1.3              # Coulomb coefficient
     vs_slip: float = 0.6         # m/s, smooth slip scale (tanh)
     c_rr: float = 0.015          # rolling resistance factor
 
-    # Environment
     g: float = 9.81              # m/s^2
     air_cdA: float = 0.55        # N/(m/s)^2 approx 0.5*rho*Cd*A
 

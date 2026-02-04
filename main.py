@@ -30,6 +30,14 @@ class DogClutch:
     self.right_most_axle_conected_gear_index = 0
     self.offset = (0, 0)
 
+class Clutch:
+  def __init__(self):
+    self.engaged = 0.0  # 0.0 to 1.0
+    self.angle_offset = 0
+    self.left_gear_index = 0
+    self.right_gear_index = 0
+    self.offset = (0, 0)
+
 class Engine:
   def __init__(self, inertia, name):
     self.inertia = inertia
@@ -138,9 +146,9 @@ displayed_numbers.reverse()
 R2, R3, R4, MEP_EvA, MEP_EvB, EvA, EvB, FD = 1.125, 0.77688172, 2/3, 1.436206897, 0.761458333, 1.931034483, 1.023809524, 5
 Engines_ratios = [R2*FD, R3*FD, R4*FD]
 
-MCI, HSG, MEP = 0, 1, 2
+ENG, HSG, MEP = 0, 1, 2
 
-Engines[MCI] = Engine(0.12, "1.6l Engine") # Main Combustion Engine
+Engines[ENG] = Engine(0.12, "1.6l Engine") # Main Combustion Engine
 Engines[HSG] = E_Engine(0.02, "HSG", max_amp=75)  # High Voltage Starter Generator
 Engines[MEP] = E_Engine(0.02, "MEP", max_amp=180)  # Main Electric Propulsion
 
@@ -209,7 +217,7 @@ def draw_rpm_gauge(Engines, pos, screen):
     cv2.putText(screen, text, (tx, ty), font, font_scale, (255, 255, 255), 2, cv2.LINE_AA)
 
   # Draw needle
-  rpm = Engines[MCI].speed * 60 / (2 * np.pi)
+  rpm = Engines[ENG].speed * 60 / (2 * np.pi)
   alpha = rpm / 1000 / 6
   alpha *= 1.25 * np.pi
   alpha -= 1.25 * np.pi
@@ -222,13 +230,13 @@ def draw_rpm_gauge(Engines, pos, screen):
   return screen
 
 def check_if_gear(item):
-  if item == 'DC':
+  if item == 'DC' or item[0] == 'C':
     return False
-  if item[-1] == 'C' or item[-1] == 'O':
+  if item[-1] in "OCPI":
     return True
   return False
 
-def load_gears_from_file(filename="gears.txt", Engines=[]):
+def load_gears_from_file(filename="gears DCT.txt", Engines=[]):
     file  = open(filename, "r")
     lines = file.readlines()
     result = [line.strip().split() for line in lines if line.strip()]
@@ -237,12 +245,14 @@ def load_gears_from_file(filename="gears.txt", Engines=[]):
     outside_conections = []
     axle_conections = []
 
+    dog_clutches = []
     clutches = []
 
     #add gears
     for i, row in enumerate(result):
       for j, item in enumerate(row):
         if check_if_gear(item):
+          print(item)
           teeth = int(item[:-2])
           inertia = teeth*teeth/1000000
           gear = Gear(teeth, inertia, item)
@@ -324,7 +334,7 @@ def load_gears_from_file(filename="gears.txt", Engines=[]):
           idx_g3 = next(index for index, g in enumerate(gears) if g.offset == g3_offset)
           clutch.right_most_axle_conected_gear_index = idx_g3
           
-          clutches.append(clutch)
+          dog_clutches.append(clutch)
           
     #add axles displacements
     axle_displacement = [0]
@@ -349,25 +359,44 @@ def load_gears_from_file(filename="gears.txt", Engines=[]):
             axle_displacement.append((R1+R2)+axle_displacement[-1])
             
             break
-    
-    #add motor gear
+
+    #add clutches
     for i, row in enumerate(result):
       for j, item in enumerate(row):
-        if item == "MCI":
-          g1_offset = ((j-1) * 150, i * 150)
+        if item == 'C':
+          clutch = Clutch()
+          clutch.offset = (j * 150, i * 150)
+          #find left gear
+          k = j
+          while True:
+            k -= 1
+            if check_if_gear(row[k]) and row[k][-1] == 'O': break
+          g1_offset = (k * 150, i * 150)
           idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
-          Engines[MCI].conected_gear_index = idx_g1
-        if item == "HSG":
-          g1_offset = ((j+1) * 150, i * 150)
-          idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
-          Engines[HSG].conected_gear_index = idx_g1
-        if item == "MEP":
-          g1_offset = ((j+1) * 150, i * 150)
-          idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
-          Engines[MEP].conected_gear_index = idx_g1
+          clutch.left_gear_index = idx_g1
+
+          #find right gear
+          k = j
+          while True:
+            k += 1
+            if check_if_gear(row[k]) and row[k][-1] == 'O': break
+          g2_offset = (k * 150, i * 150)
+          idx_g2 = next(index for index, g in enumerate(gears) if g.offset == g2_offset)
+          clutch.right_gear_index = idx_g2
+          
+          clutches.append(clutch)
+
+    #add motor gear
     
-    gears[-1].inertia = 50
-    return gears, outside_conections, axle_conections, clutches, axle_displacement, result
+    for i, row in enumerate(result):
+      for j, item in enumerate(row):
+        if item == "ENG":
+          g1_offset = ((j+1) * 150, i * 150)
+          idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
+          Engines[ENG].conected_gear_index = idx_g1
+
+    #gears[-1].inertia = 50
+    return gears, outside_conections, axle_conections, dog_clutches, axle_displacement, result, clutches
 
 def draw_gear(g, surface, module=1.8, scaling=1.0, pan_offset=(0,0), axle_displacement=[]):
   x, y = g.offset
@@ -433,7 +462,7 @@ def main():
   dt = 1/60
   debut = time.time()
   
-  gears, outside_conections, axle_conections, clutches, axle_displacement, result = load_gears_from_file(Engines=Engines)
+  gears, outside_conections, axle_conections, dog_clutches, axle_displacement, result, clutches = load_gears_from_file(Engines=Engines)
   
   pygame.init()
   screen = pygame.display.set_mode((800, 600))
@@ -451,15 +480,15 @@ def main():
       if event.type == pygame.QUIT:
         running = False
       if event.type == pygame.KEYDOWN:
-        if event.key == pygame.K_r:clutches[0].engaged = -1
-        if event.key == pygame.K_t:clutches[0].engaged = 0
-        if event.key == pygame.K_y:clutches[0].engaged = +1
-        if event.key == pygame.K_f:clutches[1].engaged = -1
-        if event.key == pygame.K_g:clutches[1].engaged = 0
-        if event.key == pygame.K_h:clutches[1].engaged = +1
-        if event.key == pygame.K_v:clutches[2].engaged = -1
-        if event.key == pygame.K_b:clutches[2].engaged = 0
-        if event.key == pygame.K_n:clutches[2].engaged = +1
+        if event.key == pygame.K_r:dog_clutches[0].engaged = -1
+        if event.key == pygame.K_t:dog_clutches[0].engaged = 0
+        if event.key == pygame.K_y:dog_clutches[0].engaged = +1
+        if event.key == pygame.K_f:dog_clutches[1].engaged = -1
+        if event.key == pygame.K_g:dog_clutches[1].engaged = 0
+        if event.key == pygame.K_h:dog_clutches[1].engaged = +1
+        if event.key == pygame.K_v:dog_clutches[2].engaged = -1
+        if event.key == pygame.K_b:dog_clutches[2].engaged = 0
+        if event.key == pygame.K_n:dog_clutches[2].engaged = +1
         
       # Zoom with mouse wheel
       if event.type == pygame.MOUSEBUTTONDOWN:
@@ -504,9 +533,9 @@ def main():
         gears[1].torque += 10
       
     if keys[pygame.K_UP]:
-      Engines[MCI].throttle = min(1, Engines[MCI].throttle + 0.01)
+      Engines[ENG].throttle = min(1, Engines[ENG].throttle + 0.01)
     else:
-      Engines[MCI].throttle = max(0, Engines[MCI].throttle - 0.01)
+      Engines[ENG].throttle = max(0, Engines[ENG].throttle - 0.01)
 
     if keys[pygame.K_a]:
       Engines[MEP].throttle = min(1, Engines[MEP].throttle + 0.01)
@@ -519,11 +548,11 @@ def main():
       Engines[HSG].throttle = max(0, Engines[HSG].throttle - 0.01)
     
     if keys[pygame.K_s]:
-      Engines[MCI].torque += 10000
+      Engines[ENG].speed += 1
 
 
-    if Engines[MCI].speed*60/(2*pi) > Engines[MCI].rev_cut: Engines[MCI].rev_limit_activated = True
-    elif Engines[MCI].speed*60/(2*pi) < Engines[MCI].rev_act and Engines[MCI].rev_limit_activated: Engines[MCI].rev_limit_activated = False
+    if Engines[ENG].speed*60/(2*pi) > Engines[ENG].rev_cut: Engines[ENG].rev_limit_activated = True
+    elif Engines[ENG].speed*60/(2*pi) < Engines[ENG].rev_act and Engines[ENG].rev_limit_activated: Engines[ENG].rev_limit_activated = False
 
     s = +1.0            # +1 external mesh, -1 internal/belt
       
@@ -543,25 +572,25 @@ def main():
         g2 = gears[index2]
         solve_gear_joint(g1, g2, 1.0, -s, dt, 0)
         
-      for clutch in clutches:
-        if clutch.engaged == 0:
-          clutch.old_engaged = 0
+      for dog_clutch in dog_clutches:
+        if dog_clutch.engaged == 0:
+          dog_clutch.old_engaged = 0
           continue
-        g1 = gears[clutch.left_gear_index]
-        g2 = gears[clutch.right_gear_index]
-        g3 = gears[clutch.right_most_axle_conected_gear_index]
+        g1 = gears[dog_clutch.left_gear_index]
+        g2 = gears[dog_clutch.right_gear_index]
+        g3 = gears[dog_clutch.right_most_axle_conected_gear_index]
         ratio = 1.0
 
-        if clutch.engaged == -1:
-          if clutch.old_engaged != -1:
-            clutch.angle_offset = g1.angle - g3.angle
-            clutch.old_engaged = -1
-          solve_gear_joint(g1, g3, 1.0, -s, dt, clutch.angle_offset)
-        if clutch.engaged == +1:
-          if clutch.old_engaged != +1:
-            clutch.angle_offset = g2.angle - g3.angle
-            clutch.old_engaged = +1
-          solve_gear_joint(g2, g3, 1.0, -s, dt, clutch.angle_offset)
+        if dog_clutch.engaged == -1:
+          if dog_clutch.old_engaged != -1:
+            dog_clutch.angle_offset = g1.angle - g3.angle
+            dog_clutch.old_engaged = -1
+          solve_gear_joint(g1, g3, 1.0, -s, dt, dog_clutch.angle_offset)
+        if dog_clutch.engaged == +1:
+          if dog_clutch.old_engaged != +1:
+            dog_clutch.angle_offset = g2.angle - g3.angle
+            dog_clutch.old_engaged = +1
+          solve_gear_joint(g2, g3, 1.0, -s, dt, dog_clutch.angle_offset)
       
       for engine in Engines:
         g1 = gears[engine.conected_gear_index]
@@ -579,14 +608,15 @@ def main():
       #print(g1.speed)
     
     
-    #Engines[MCI].torque += torque_from_omega(Engines[MCI].speed)*(Engines[MCI].throttle if not Engines[MCI].rev_limit_activated else 0)
-    #tau_c = Engines[MCI].tau0 * copysign(1, Engines[MCI].speed) if Engines[MCI].speed != 0 else 0
-    #Engines[MCI].speed += (Engines[MCI].torque - tau_c - Engines[MCI].drag*Engines[MCI].speed) / Engines[MCI].inertia * dt
-    #if abs(Engines[MCI].speed) < 0.01: Engines[MCI].speed = 0
-    #Engines[MCI].torque = 0.0
+    #Engines[ENG].torque += torque_from_omega(Engines[ENG].speed)*(Engines[ENG].throttle if not Engines[ENG].rev_limit_activated else 0)
+    #tau_c = Engines[ENG].tau0 * copysign(1, Engines[ENG].speed) if Engines[ENG].speed != 0 else 0
+    #Engines[ENG].speed += (Engines[ENG].torque - tau_c - Engines[ENG].drag*Engines[ENG].speed) / Engines[ENG].inertia * dt
+    #if abs(Engines[ENG].speed) < 0.01: Engines[ENG].speed = 0
+    #Engines[ENG].torque = 0.0
 
-    #print(f"Engine: {Engines[MCI].speed*60/(2*pi):.0f} rpm, Engine2 {Engines[MEP].speed*60/(2*pi):.0f} rpm, Engine3 {Engines[HSG].speed*60/(2*pi):.0f} rpm")
+    #print(f"Engine: {Engines[ENG].speed*60/(2*pi):.0f} rpm, Engine2 {Engines[MEP].speed*60/(2*pi):.0f} rpm, Engine3 {Engines[HSG].speed*60/(2*pi):.0f} rpm")
     #print("Total constraint error:", tot_error)
+
     screen.fill(BACKGROUND_COLOR)
 
     error_tot/=100
@@ -619,8 +649,8 @@ def main():
           pygame.draw.line(screen, (200,200,200), (x-150*scaling, y), (x+150*scaling, y), max(1, int(3*scaling)))
 
           c_offset = (j * 150, i * 150)
-          idx_c = next(index for index, c in enumerate(clutches) if c.offset == c_offset)
-          clutch = clutches[idx_c]
+          idx_c = next(index for index, c in enumerate(dog_clutches) if c.offset == c_offset)
+          clutch = dog_clutches[idx_c]
           engagement_offset = clutch.engaged * 30*scaling
 
           pygame.draw.rect(screen, (150,50,50), (x-15*scaling + engagement_offset, y-15*scaling, 30*scaling, 30*scaling))      
@@ -630,7 +660,7 @@ def main():
 
     draw_rpm_gauge(Engines, (260/2, 260/2), np.zeros((260, 260, 3), dtype=np.uint8))
     
-    #print(f"{Engines[MCI].angle}%")
+    #print(f"{Engines[ENG].angle}%")
       
     fps = 1.0 / dt if dt > 0 else 0.0
     font = pygame.font.SysFont("Arial", 20)
