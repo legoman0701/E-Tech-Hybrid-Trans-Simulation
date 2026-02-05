@@ -1,4 +1,4 @@
-from math import sin, cos, pi, copysign
+from math import sin, cos, pi, copysign, isfinite
 import pygame, time
 from engine_curve import torque_from_omega
 import multiprocessing
@@ -72,82 +72,23 @@ class Engine:
     self.torque = 0.0
     self.angle += self.speed * dt
 
-class E_Engine:
-    def __init__(self, inertia, name, max_amp=200, volt=230, k_t=0.8, eff=0.9):
-        """
-        inertia [kg·m²], speed [rad/s], torque [N·m]
-        max_amp: inverter phase current limit [A] (effective)
-        volt: DC bus [V]
-        k_t: torque constant [N·m/A]   (τ = k_t * I)
-        eff: mechanical efficiency [-] (P_mech = eff * V * I)
-        """
-        self.inertia = float(inertia)
-        self.name = name
-        self.speed = 0.0
-        self.angle = 0.0
-        self.torque = 0.0                 # external torque accumulator
-        self.drag = 0.005                  # viscous loss coeff [N·m·s/rad]
-        self.tau0 = 0
-        self.offset = (0, 0)
-        self.throttle = 0.0               # [-1..1]
-        self.conected_gear_index = 0
-        self.max_amp = float(max_amp)
-        self.volt = float(volt)
-        self.k_t = float(k_t)
-        self.eff = float(eff)
-        self._omega_eps = 1e-3            # avoids div-by-zero in power cap
+class TransESC:
+  def __init__(self):
+    self.gears_p = [[0, -1], [0, 1], [1, 0]]
+    self.gears_i = [[0, 1], [0, -1], [1, 0], [-1, 0]]
+    self.dc_p = [0, 2]
+    self.dc_i = [1, 3]
+    self.gear = 0
+  
+  def set_gear(self, dog_clutches):
+    if self.gear < 0 or self.gear >= 8:
+      return
 
-    @property
-    def omega_base(self):
-        """Knee/base speed where const-torque -> const-power."""
-        return (self.volt * self.eff) / max(self.k_t, 1e-9)  # rad/s
-
-    def get_torque(self):
-        """
-        Current-limited + power-limited available torque (signed).
-        - Constant torque: τ <= k_t * I_cmd
-        - Constant power:  τ <= (V * I_cmd * eff) / |ω|
-        """
-        # Command & sign
-        s = max(-1.0, min(1.0, float(self.throttle)))
-        if s == 0.0:
-            return 0.0
-        sign = 1.0 if s >= 0 else -1.0
-
-        # Requested current (A) and limits
-        I_cmd = abs(s) * self.max_amp
-
-        # Plateau from current limit
-        tau_ct = self.k_t * I_cmd
-
-        # Power cap -> τ = P/ω
-        P_mech_max = self.volt * I_cmd * self.eff
-        omega_mag = abs(self.speed)
-        tau_cp = P_mech_max / max(omega_mag, self._omega_eps)
-
-        # Available torque is the tighter of the two
-        tau_avail = min(tau_ct, tau_cp)
-        return sign * tau_avail
-
-    def apply_physics(self, dt):
-        # Apply motor torque (adds to any externally applied torques)
-        self.torque += self.get_torque()
-
-        # Coulomb friction + viscous drag
-        tau_c = self.tau0 * (1.0 if self.speed > 0 else -1.0) if self.speed != 0 else 0.0
-
-        # ω' = (Στ - τ_c - b*ω) / J
-        self.speed += (self.torque - tau_c - self.drag * self.speed) / self.inertia * dt
-
-        # Deadband near zero to avoid chatter
-        if abs(self.speed) < 0.01:
-            self.speed = 0.0
-
-        # Reset external torque accumulator for next step
-        self.torque = 0.0
-
-        # Integrate angle
-        self.angle += self.speed * dt
+    if self.gear%2 == 0:
+      for i in range(len(self.dc_p)):
+        dog_clutches[i].engaged = self.gears_p[(self.gear-1)//2][i]
+      for i in range(len(self.dc_i)):
+        dog_clutches[i].engaged = 0     
 
 Engines = [None]*3
 displayed_numbers = [0, 1, 2, 3, 4, 5, 6]
@@ -159,15 +100,17 @@ Engines_ratios = [R2*FD, R3*FD, R4*FD]
 ENG, HSG, MEP = 0, 1, 2
 
 Engines[ENG] = Engine(0.12, "1.6l Engine") # Main Combustion Engine
-Engines[HSG] = E_Engine(0.02, "HSG", max_amp=75)  # High Voltage Starter Generator
-Engines[MEP] = E_Engine(0.02, "MEP", max_amp=180)  # Main Electric Propulsion
 
-def solve_gear_joint(g_in, g_out, ratio, s, dt, angle_offset):
+def solve_gear_joint(g_in, g_out, ratio, s, dt, angle_offset, coef=1, Cdot_only=False):
     #C    = (1.0 * g_in.angle) + s * (ratio * g_out.angle)
-    C = solve_gear_c(g_in, g_out, ratio, s, dt, 30, angle_offset)
+    C = 0
+    if coef != 1 or Cdot_only:
+      C = solve_gear_c(g_in, g_out, ratio, s, dt, 30, angle_offset)
     #Cdot = (1.0 * g_in.speed) + s * (ratio * g_out.speed)
     Cdot = solve_gear_cdot(g_in, g_out, ratio, s, dt)
-    lam  =  C + Cdot
+    lam  =  (C + Cdot)*coef
+    if Cdot_only:
+      lam = min(max(Cdot, -100), 100)
     #lam  = Cdot
     global error_tot
     error_tot += abs(C)
@@ -181,8 +124,15 @@ def solve_gear_cdot(g_in, g_out, ratio, s, dt, strength=0.7):
     r = ratio
     cd = g_in.speed + s*r*g_out.speed
     inv = (1.0/I1) + (r*r)*(1.0/I2)
-    lam = strength*cd/(dt*inv)
-    return lam
+    if not (isfinite(cd) and isfinite(inv) and isfinite(dt)):
+      return 0.0
+    denom = dt * inv
+    if denom == 0:
+      return 0.0
+    lam = strength*cd/denom
+    if not isfinite(lam):
+      return 0.0
+    return max(-1e6, min(1e6, lam))
 
 def solve_gear_c(g_in, g_out, ratio, s, dt, strength, angle_offset):
     I1, I2 = g_in.inertia, g_out.inertia
@@ -190,8 +140,15 @@ def solve_gear_c(g_in, g_out, ratio, s, dt, strength, angle_offset):
     r = ratio
     cd = g_in.angle + (s*r*g_out.angle) - angle_offset
     inv = (1.0/I1) + (r*r)*(1.0/I2)
-    lam = strength*cd/(dt*inv)
-    return lam
+    if not (isfinite(cd) and isfinite(inv) and isfinite(dt)):
+      return 0.0
+    denom = dt * inv
+    if denom == 0:
+      return 0.0
+    lam = strength*cd/denom
+    if not isfinite(lam):
+      return 0.0
+    return max(-1e6, min(1e6, lam))
 
 def draw_rpm_gauge(Engines, pos, screen):
   # screen is expected to be a numpy array (cv2 image)
@@ -572,6 +529,8 @@ def main():
   debut = time.time()
   
   gears, outside_conections, axle_conections, dog_clutches, axle_displacement, result, clutches, slipping_clutches = load_gears_from_file(Engines=Engines)
+
+  DCT_Trans = TransESC()
   
   pygame.init()
   screen = pygame.display.set_mode((800, 600))
@@ -591,15 +550,8 @@ def main():
       if event.type == pygame.KEYDOWN:
         if event.key == pygame.K_d:
           debug_mode = not debug_mode
-        if event.key == pygame.K_r:dog_clutches[0].engaged = -1
-        if event.key == pygame.K_t:dog_clutches[0].engaged = 0
-        if event.key == pygame.K_y:dog_clutches[0].engaged = +1
-        if event.key == pygame.K_f:dog_clutches[1].engaged = -1
-        if event.key == pygame.K_g:dog_clutches[1].engaged = 0
-        if event.key == pygame.K_h:dog_clutches[1].engaged = +1
-        if event.key == pygame.K_v:dog_clutches[2].engaged = -1
-        if event.key == pygame.K_b:dog_clutches[2].engaged = 0
-        if event.key == pygame.K_n:dog_clutches[2].engaged = +1
+        if event.key == pygame.K_z:DCT_Trans.gear+=1
+        if event.key == pygame.K_s:DCT_Trans.gear-=1
         # Slipping clutch controls
         if event.key == pygame.K_1 and len(slipping_clutches) > 0:
           slipping_clutches[0].engaged = 1.0 if slipping_clutches[0].engaged == 0 else 0.0
@@ -652,16 +604,6 @@ def main():
       Engines[ENG].throttle = min(1, Engines[ENG].throttle + 0.1)
     else:
       Engines[ENG].throttle = max(0, Engines[ENG].throttle - 0.1)
-
-    if keys[pygame.K_a]:
-      Engines[MEP].throttle = min(1, Engines[MEP].throttle + 0.01)
-    else:
-      Engines[MEP].throttle = max(0, Engines[MEP].throttle - 0.01)
-    
-    if keys[pygame.K_e]:
-      Engines[HSG].throttle = min(-1, Engines[HSG].throttle + 0.01)
-    else:
-      Engines[HSG].throttle = max(0, Engines[HSG].throttle - 0.01)
     
     if keys[pygame.K_s]:
       Engines[ENG].speed += 1
@@ -675,6 +617,7 @@ def main():
     #dt = min(1/300, dt)
     dt /= 100
     error_tot = 0
+    DCT_Trans.set_gear(dog_clutches)
     for i in range(100):
       for index1, index2 in outside_conections:
         g_in = gears[index1]
@@ -696,19 +639,27 @@ def main():
         g2 = gears[dog_clutch.right_gear_index]
         g3 = gears[dog_clutch.right_most_axle_conected_gear_index]
         ratio = 1.0
+        sync_speed_threshold = 60.0  # rad/s; use soft sync if mismatched
 
         if dog_clutch.engaged == -1:
           if dog_clutch.old_engaged != -1:
             dog_clutch.angle_offset = g1.angle - g3.angle
             dog_clutch.old_engaged = -1
-          solve_gear_joint(g1, g3, 1.0, -s, dt, dog_clutch.angle_offset)
+          if abs(g1.speed - g3.speed) > sync_speed_threshold:
+            solve_gear_joint(g1, g3, 1.0, -s, dt, dog_clutch.angle_offset, Cdot_only=True)
+          else:
+            solve_gear_joint(g1, g3, 1.0, -s, dt, dog_clutch.angle_offset)
         if dog_clutch.engaged == +1:
           if dog_clutch.old_engaged != +1:
             dog_clutch.angle_offset = g2.angle - g3.angle
             dog_clutch.old_engaged = +1
-          solve_gear_joint(g2, g3, 1.0, -s, dt, dog_clutch.angle_offset)
+          if abs(g2.speed - g3.speed) > sync_speed_threshold:
+            solve_gear_joint(g2, g3, 1.0, -s, dt, dog_clutch.angle_offset, Cdot_only=True)
+          else:
+            solve_gear_joint(g2, g3, 1.0, -s, dt, dog_clutch.angle_offset)
       
       for engine in Engines:
+        if engine == None: continue
         g1 = gears[engine.conected_gear_index]
         solve_gear_joint(engine, g1, 1.0, -s, dt, 0)
       
@@ -717,30 +668,23 @@ def main():
         if slip_clutch.engaged > 0.01:
           g_left = gears[slip_clutch.left_gear_index]
           g_right = gears[slip_clutch.right_gear_index]
-          
-          # Speed difference across clutch
-          speed_diff = g_left.speed - g_right.speed
-          
-          # Clutch torque (viscous damping model for slip)
-          # When fully engaged, acts like strong damper
-          # When slipping, transfers less torque
-          clutch_damping = slip_clutch.stiffness * slip_clutch.engaged
-          clutch_torque = clutch_damping * speed_diff
-          
-          # Limit to maximum clutch capacity
-          max_torque = slip_clutch.max_torque * slip_clutch.engaged
-          clutch_torque = max(-max_torque, min(max_torque, clutch_torque))
-          
-          # Apply equal and opposite torques
-          g_left.torque -= clutch_torque
-          g_right.torque += clutch_torque
+          solve_gear_joint(g_left, g_right, 1.0, -s, dt, 0, coef=1, Cdot_only=True)
       
       for g in gears:
-        g.speed += ((g.torque) - g.drag * g.speed) / g.inertia * (dt)
+        inertia = g.inertia if isfinite(g.inertia) and g.inertia > 1e-8 else 1e-8
+        if not (isfinite(g.speed) and isfinite(g.torque) and isfinite(g.drag)):
+          g.speed = 0.0
+          g.torque = 0.0
+        g.speed += ((g.torque) - g.drag * g.speed) / inertia * (dt)
+        if not isfinite(g.speed):
+          g.speed = 0.0
         g.angle += g.speed * (dt)
+        if not isfinite(g.angle):
+          g.angle = 0.0
         g.torque = 0.0
       
       for engine in Engines:
+        if engine == None: continue
         engine.apply_physics(dt)
 
       #sim.step(dt)
@@ -888,6 +832,9 @@ def main():
     text_surface = font.render(f"FPS: {fps:.2f}", True, (255, 255, 255))
     screen.blit(text_surface, (10, 10))
     
+    text_surface = font.render(f"Gear: {DCT_Trans.gear}", True, (255, 255, 255))
+    screen.blit(text_surface, (10, 40))
+
     pygame.display.flip()
     
     
