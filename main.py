@@ -38,6 +38,16 @@ class Clutch:
     self.right_gear_index = 0
     self.offset = (0, 0)
 
+class SlippingClutch:
+  def __init__(self, clutch_type='P'):
+    self.engaged = 0.0  # 0.0 to 1.0, controls clutch pressure
+    self.left_gear_index = 0  # Index of the #C gear on the left
+    self.right_gear_index = 0  # Index of the #P or #I gear on the right
+    self.offset = (0, 0)
+    self.clutch_type = clutch_type  # 'P' for pair, 'I' for impair
+    self.max_torque = 500.0  # Maximum torque the clutch can transfer [N·m]
+    self.stiffness = 50.0  # Clutch spring stiffness
+
 class Engine:
   def __init__(self, inertia, name):
     self.inertia = inertia
@@ -230,173 +240,271 @@ def draw_rpm_gauge(Engines, pos, screen):
   return screen
 
 def check_if_gear(item):
-  if item == 'DC' or item[0] == 'C':
+    """Check if an item in the grid represents a gear."""
+    if item == 'DC' or item in ['CP', 'CI'] or item[0] == 'C':
+        return False
+    if item[-1] in "OCPI":
+        return True
     return False
-  if item[-1] in "OCPI":
-    return True
-  return False
 
 def load_gears_from_file(filename="gears DCT.txt", Engines=[]):
-    file  = open(filename, "r")
-    lines = file.readlines()
-    result = [line.strip().split() for line in lines if line.strip()]
-
+    """
+    Load transmission configuration from a text file.
+    
+    Returns:
+        tuple: (gears, outside_connections, axle_connections, dog_clutches, 
+                axle_displacement, grid_data, clutches)
+    """
+    GRID_SPACING = 150
+    GEAR_MODULE = 1.8
+    
+    # Helper functions
+    def get_offset(col, row):
+        """Convert grid position to offset coordinates."""
+        return (col * GRID_SPACING, row * GRID_SPACING)
+    
+    def find_gear_index(gears, offset):
+        """Find gear index by its offset position."""
+        return next((index for index, g in enumerate(gears) if g.offset == offset), None)
+    
+    def find_adjacent_gear(row, start_col, direction, gear_type='O'):
+        """
+        Find the nearest gear in a given direction along a row.
+        
+        Args:
+            row: The row to search in
+            start_col: Starting column index
+            direction: -1 for left, +1 for right
+            gear_type: 'O' for output gear, 'C' for connected gear
+        """
+        col = start_col
+        while 0 <= col < len(row):
+            col += direction
+            if col < 0 or col >= len(row):
+                break
+            if check_if_gear(row[col]) and row[col][-1] == gear_type:
+                return col
+        return None
+    
+    # Read and parse file
+    with open(filename, "r") as file:
+        lines = file.readlines()
+    grid_data = [line.strip().split() for line in lines if line.strip()]
+    
     gears = []
-    outside_conections = []
-    axle_conections = []
-
+    outside_connections = []
+    axle_connections = []
     dog_clutches = []
     clutches = []
-
-    #add gears
-    for i, row in enumerate(result):
-      for j, item in enumerate(row):
-        if check_if_gear(item):
-          print(item)
-          teeth = int(item[:-2])
-          inertia = teeth*teeth/1000000
-          gear = Gear(teeth, inertia, item)
-          gear.offset = (j * 150, i * 150)
-          gears.append(gear)
-          print(f"Added gear: {item} with {teeth} teeth and inertia {inertia}")
-
-    #add external conecting gears
-    for i in range(len(result)-1):
-      row = result[i]
-      for j, item in enumerate(row):
-        if check_if_gear(item):
-          if check_if_gear(result[i+1][j]):
-            g1_offset = (j * 150, i * 150)
-            g2_offset = (j * 150, (i+1) * 150)
-            idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
-            idx_g2 = next(index for index, g in enumerate(gears) if g.offset == g2_offset)
-            outside_conections.append((idx_g1, idx_g2))
-
-    #add axle conecting gears
-    for i, row in enumerate(result):
-      for j in range(len(row)-1):
-        item = row[j]
-        if item != 'DC' and item[-1] == 'C':
-          if row[j+1] != 'DC' and row[j+1][-1] == 'C':
-            g1_offset = (j * 150, i * 150)
-            g2_offset = ((j+1) * 150, i * 150)
-            idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
-            idx_g2 = next(index for index, g in enumerate(gears) if g.offset == g2_offset)
-            axle_conections.append((idx_g1, idx_g2))
+    slipping_clutches = []
     
-    #add axle conecting gears with gaps or dog_clutchs
-    for i, row in enumerate(result):
-      for j in range(1, len(row)-1):
-        item = row[j]
-        if row[j-1] != 'DC' and row[j-1][-1] == 'C':
-          if item == '-' or item == "DC" or  item[-1] == 'O':
-            g1 = row[j-1]
-            offset = 0
-            while row[j+offset] == '-' or row[j+offset] == "DC" or row[j+offset][-1] == 'O':
-              offset += 1
-            g2 = row[j+offset]
-            g1_offset = ((j-1) * 150, i * 150)
-            g2_offset = ((j+offset) * 150, i * 150)
-            idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
-            idx_g2 = next(index for index, g in enumerate(gears) if g.offset == g2_offset)
-            axle_conections.append((idx_g1, idx_g2))
+    # Step 1: Create all gears from the grid
+    for row_idx, row in enumerate(grid_data):
+        for col_idx, item in enumerate(row):
+            if check_if_gear(item):
+                teeth = int(item[:-2])
+                inertia = teeth * teeth / 1000000
+                gear = Gear(teeth, inertia, item)
+                gear.offset = get_offset(col_idx, row_idx)
+                gears.append(gear)
     
-    #add dog clutches
-    for i, row in enumerate(result):
-      for j, item in enumerate(row):
-        if item == 'DC':
-          clutch = DogClutch()
-          clutch.offset = (j * 150, i * 150)
-          #find left gear
-          k = j
-          while True:
-            k -= 1
-            if check_if_gear(row[k]) and row[k][-1] == 'O': break
-          g1_offset = (k * 150, i * 150)
-          idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
-          clutch.left_gear_index = idx_g1
-
-          #find right gear
-          k = j
-          while True:
-            k += 1
-            if check_if_gear(row[k]) and row[k][-1] == 'O': break
-          g2_offset = (k * 150, i * 150)
-          idx_g2 = next(index for index, g in enumerate(gears) if g.offset == g2_offset)
-          clutch.right_gear_index = idx_g2
-          
-          #add axle connection to the right most gear
-          k = j
-          while True:
-            k += 1
-            if check_if_gear(row[k]) and row[k][-1] == 'C': break
-          g3_offset = (k * 150, i * 150)
-          idx_g3 = next(index for index, g in enumerate(gears) if g.offset == g3_offset)
-          clutch.right_most_axle_conected_gear_index = idx_g3
-          
-          dog_clutches.append(clutch)
-          
-    #add axles displacements
-    axle_displacement = [0]
-    for i in range(1, len(result)):
-      row = result[i]
-      for j, item in enumerate(row):
-        if check_if_gear(item):
-          if check_if_gear(result[i-1][j]):
-            g1_offset = (j * 150, (i-1) * 150)
-            idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
-            g2_offset = (j * 150, i * 150)
-            idx_g2 = next(index for index, g in enumerate(gears) if g.offset == g2_offset)
-
-            g1 = gears[idx_g1]
-            g2 = gears[idx_g2]
-
-            Z1 = g1.teeth
-            Z2 = g2.teeth
-            R1 = Z1*1.8
-            R2 = Z2*1.8
-
-            axle_displacement.append((R1+R2)+axle_displacement[-1])
+    # Step 2: Add vertical (external mesh) connections
+    for row_idx in range(len(grid_data) - 1):
+        for col_idx, item in enumerate(grid_data[row_idx]):
+            if check_if_gear(item) and check_if_gear(grid_data[row_idx + 1][col_idx]):
+                offset1 = get_offset(col_idx, row_idx)
+                offset2 = get_offset(col_idx, row_idx + 1)
+                idx1 = find_gear_index(gears, offset1)
+                idx2 = find_gear_index(gears, offset2)
+                if idx1 is not None and idx2 is not None:
+                    outside_connections.append((idx1, idx2))
+    
+    # Step 3: Add horizontal (axle) connections - adjacent gears
+    for row_idx, row in enumerate(grid_data):
+        for col_idx in range(len(row) - 1):
+            current_item = row[col_idx]
+            next_item = row[col_idx + 1]
             
-            break
-
-    #add clutches
-    for i, row in enumerate(result):
-      for j, item in enumerate(row):
-        if item == 'C':
-          clutch = Clutch()
-          clutch.offset = (j * 150, i * 150)
-          #find left gear
-          k = j
-          while True:
-            k -= 1
-            if check_if_gear(row[k]) and row[k][-1] == 'O': break
-          g1_offset = (k * 150, i * 150)
-          idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
-          clutch.left_gear_index = idx_g1
-
-          #find right gear
-          k = j
-          while True:
-            k += 1
-            if check_if_gear(row[k]) and row[k][-1] == 'O': break
-          g2_offset = (k * 150, i * 150)
-          idx_g2 = next(index for index, g in enumerate(gears) if g.offset == g2_offset)
-          clutch.right_gear_index = idx_g2
-          
-          clutches.append(clutch)
-
-    #add motor gear
+            # Connect adjacent #C gears
+            if current_item[-1:] == 'C' and current_item != 'DC':
+                if next_item[-1:] == 'C' and next_item != 'DC':
+                    offset1 = get_offset(col_idx, row_idx)
+                    offset2 = get_offset(col_idx + 1, row_idx)
+                    idx1 = find_gear_index(gears, offset1)
+                    idx2 = find_gear_index(gears, offset2)
+                    if idx1 is not None and idx2 is not None:
+                        axle_connections.append((idx1, idx2))
+            
+            # Connect adjacent #P gears
+            if current_item[-1:] == 'P' and check_if_gear(current_item):
+                if next_item[-1:] == 'P' and check_if_gear(next_item):
+                    offset1 = get_offset(col_idx, row_idx)
+                    offset2 = get_offset(col_idx + 1, row_idx)
+                    idx1 = find_gear_index(gears, offset1)
+                    idx2 = find_gear_index(gears, offset2)
+                    if idx1 is not None and idx2 is not None:
+                        axle_connections.append((idx1, idx2))
+            
+            # Connect adjacent #I gears
+            if current_item[-1:] == 'I' and check_if_gear(current_item):
+                if next_item[-1:] == 'I' and check_if_gear(next_item):
+                    offset1 = get_offset(col_idx, row_idx)
+                    offset2 = get_offset(col_idx + 1, row_idx)
+                    idx1 = find_gear_index(gears, offset1)
+                    idx2 = find_gear_index(gears, offset2)
+                    if idx1 is not None and idx2 is not None:
+                        axle_connections.append((idx1, idx2))
     
-    for i, row in enumerate(result):
-      for j, item in enumerate(row):
-        if item == "ENG":
-          g1_offset = ((j+1) * 150, i * 150)
-          idx_g1 = next(index for index, g in enumerate(gears) if g.offset == g1_offset)
-          Engines[ENG].conected_gear_index = idx_g1
-
-    #gears[-1].inertia = 50
-    return gears, outside_conections, axle_conections, dog_clutches, axle_displacement, result, clutches
+    # Step 4: Add horizontal (axle) connections - gears with gaps
+    for row_idx, row in enumerate(grid_data):
+        col_idx = 0
+        while col_idx < len(row):
+            item = row[col_idx]
+            
+            # Check if current item is a connected gear (#C, #P, or #I)
+            is_connectable = (
+                (item[-1:] == 'C' and item != 'DC' and check_if_gear(item)) or
+                (item[-1:] == 'P' and check_if_gear(item)) or
+                (item[-1:] == 'I' and check_if_gear(item))
+            )
+            
+            if is_connectable:
+                gear_type = item[-1:]
+                # Find the next gear with matching type on the same shaft
+                search_offset = 1
+                found_next = False
+                
+                while col_idx + search_offset < len(row) and search_offset < 10:  # Limit search distance
+                    next_item = row[col_idx + search_offset]
+                    
+                    # Stop if we hit another type of connected gear (different shaft)
+                    if check_if_gear(next_item):
+                        next_type = next_item[-1:]
+                        if next_type in ['C', 'P', 'I'] and next_type != gear_type:
+                            # Different shaft type, stop searching
+                            break
+                        elif next_type == gear_type:
+                            # Found matching gear on same shaft
+                            offset1 = get_offset(col_idx, row_idx)
+                            offset2 = get_offset(col_idx + search_offset, row_idx)
+                            idx1 = find_gear_index(gears, offset1)
+                            idx2 = find_gear_index(gears, offset2)
+                            if idx1 is not None and idx2 is not None:
+                                # Avoid duplicate connections
+                                if (idx1, idx2) not in axle_connections and (idx2, idx1) not in axle_connections:
+                                    axle_connections.append((idx1, idx2))
+                            found_next = True
+                            break
+                    
+                    search_offset += 1
+            
+            col_idx += 1
+    
+    # Step 5: Parse dog clutches
+    for row_idx, row in enumerate(grid_data):
+        for col_idx, item in enumerate(row):
+            if item == 'DC':
+                clutch = DogClutch()
+                clutch.offset = get_offset(col_idx, row_idx)
+                
+                # Find left output gear
+                left_col = find_adjacent_gear(row, col_idx, -1, 'O')
+                if left_col is not None:
+                    idx = find_gear_index(gears, get_offset(left_col, row_idx))
+                    if idx is not None:
+                        clutch.left_gear_index = idx
+                
+                # Find right output gear
+                right_col = find_adjacent_gear(row, col_idx, +1, 'O')
+                if right_col is not None:
+                    idx = find_gear_index(gears, get_offset(right_col, row_idx))
+                    if idx is not None:
+                        clutch.right_gear_index = idx
+                
+                # Find rightmost connected gear
+                connected_col = find_adjacent_gear(row, col_idx, +1, 'C')
+                if connected_col is not None:
+                    idx = find_gear_index(gears, get_offset(connected_col, row_idx))
+                    if idx is not None:
+                        clutch.right_most_axle_conected_gear_index = idx
+                
+                dog_clutches.append(clutch)
+    
+    # Step 6: Calculate axle displacements based on gear radii
+    axle_displacement = [0]
+    for row_idx in range(1, len(grid_data)):
+        for col_idx, item in enumerate(grid_data[row_idx]):
+            if check_if_gear(item) and check_if_gear(grid_data[row_idx - 1][col_idx]):
+                offset1 = get_offset(col_idx, row_idx - 1)
+                offset2 = get_offset(col_idx, row_idx)
+                idx1 = find_gear_index(gears, offset1)
+                idx2 = find_gear_index(gears, offset2)
+                
+                if idx1 is not None and idx2 is not None:
+                    gear1 = gears[idx1]
+                    gear2 = gears[idx2]
+                    radius1 = gear1.teeth * GEAR_MODULE
+                    radius2 = gear2.teeth * GEAR_MODULE
+                    axle_displacement.append((radius1 + radius2) + axle_displacement[-1])
+                    break
+    
+    # Step 7: Parse regular clutches
+    for row_idx, row in enumerate(grid_data):
+        for col_idx, item in enumerate(row):
+            if item == 'C':
+                clutch = Clutch()
+                clutch.offset = get_offset(col_idx, row_idx)
+                
+                # Find left output gear
+                left_col = find_adjacent_gear(row, col_idx, -1, 'O')
+                if left_col is not None:
+                    idx = find_gear_index(gears, get_offset(left_col, row_idx))
+                    if idx is not None:
+                        clutch.left_gear_index = idx
+                
+                # Find right output gear
+                right_col = find_adjacent_gear(row, col_idx, +1, 'O')
+                if right_col is not None:
+                    idx = find_gear_index(gears, get_offset(right_col, row_idx))
+                    if idx is not None:
+                        clutch.right_gear_index = idx
+                
+                clutches.append(clutch)
+    
+    # Step 7b: Parse slipping clutches (CP and CI)
+    for row_idx, row in enumerate(grid_data):
+        for col_idx, item in enumerate(row):
+            if item in ['CP', 'CI']:
+                clutch_type = item[1]  # 'P' or 'I'
+                clutch = SlippingClutch(clutch_type)
+                clutch.offset = get_offset(col_idx, row_idx)
+                
+                # Find left #C gear
+                left_col = find_adjacent_gear(row, col_idx, -1, 'C')
+                if left_col is not None:
+                    idx = find_gear_index(gears, get_offset(left_col, row_idx))
+                    if idx is not None:
+                        clutch.left_gear_index = idx
+                
+                # Find right #P or #I gear (depending on clutch type)
+                right_col = find_adjacent_gear(row, col_idx, +1, clutch_type)
+                if right_col is not None:
+                    idx = find_gear_index(gears, get_offset(right_col, row_idx))
+                    if idx is not None:
+                        clutch.right_gear_index = idx
+                
+                slipping_clutches.append(clutch)
+    
+    # Step 8: Connect engines to their gears
+    for row_idx, row in enumerate(grid_data):
+        for col_idx, item in enumerate(row):
+            if item == "ENG":
+                engine_gear_offset = get_offset(col_idx + 1, row_idx)
+                idx = find_gear_index(gears, engine_gear_offset)
+                if idx is not None:
+                    Engines[ENG].conected_gear_index = idx
+    
+    return gears, outside_connections, axle_connections, dog_clutches, axle_displacement, grid_data, clutches, slipping_clutches
 
 def draw_gear(g, surface, module=1.8, scaling=1.0, pan_offset=(0,0), axle_displacement=[]):
   x, y = g.offset
@@ -456,13 +564,14 @@ scaling = 1
 pan_offset = [0, 0]
 is_panning = False
 last_mouse_pos = (0, 0)
+debug_mode = False
 
 def main():
-  global scaling, pan_offset, is_panning, last_mouse_pos, error_tot
+  global scaling, pan_offset, is_panning, last_mouse_pos, error_tot, debug_mode
   dt = 1/60
   debut = time.time()
   
-  gears, outside_conections, axle_conections, dog_clutches, axle_displacement, result, clutches = load_gears_from_file(Engines=Engines)
+  gears, outside_conections, axle_conections, dog_clutches, axle_displacement, result, clutches, slipping_clutches = load_gears_from_file(Engines=Engines)
   
   pygame.init()
   screen = pygame.display.set_mode((800, 600))
@@ -480,6 +589,8 @@ def main():
       if event.type == pygame.QUIT:
         running = False
       if event.type == pygame.KEYDOWN:
+        if event.key == pygame.K_d:
+          debug_mode = not debug_mode
         if event.key == pygame.K_r:dog_clutches[0].engaged = -1
         if event.key == pygame.K_t:dog_clutches[0].engaged = 0
         if event.key == pygame.K_y:dog_clutches[0].engaged = +1
@@ -489,6 +600,11 @@ def main():
         if event.key == pygame.K_v:dog_clutches[2].engaged = -1
         if event.key == pygame.K_b:dog_clutches[2].engaged = 0
         if event.key == pygame.K_n:dog_clutches[2].engaged = +1
+        # Slipping clutch controls
+        if event.key == pygame.K_1 and len(slipping_clutches) > 0:
+          slipping_clutches[0].engaged = 1.0 if slipping_clutches[0].engaged == 0 else 0.0
+        if event.key == pygame.K_2 and len(slipping_clutches) > 1:
+          slipping_clutches[1].engaged = 1.0 if slipping_clutches[1].engaged == 0 else 0.0
         
       # Zoom with mouse wheel
       if event.type == pygame.MOUSEBUTTONDOWN:
@@ -533,9 +649,9 @@ def main():
         gears[1].torque += 10
       
     if keys[pygame.K_UP]:
-      Engines[ENG].throttle = min(1, Engines[ENG].throttle + 0.01)
+      Engines[ENG].throttle = min(1, Engines[ENG].throttle + 0.1)
     else:
-      Engines[ENG].throttle = max(0, Engines[ENG].throttle - 0.01)
+      Engines[ENG].throttle = max(0, Engines[ENG].throttle - 0.1)
 
     if keys[pygame.K_a]:
       Engines[MEP].throttle = min(1, Engines[MEP].throttle + 0.01)
@@ -596,6 +712,29 @@ def main():
         g1 = gears[engine.conected_gear_index]
         solve_gear_joint(engine, g1, 1.0, -s, dt, 0)
       
+      # Apply slipping clutch constraints (torque-based, not position-based)
+      for slip_clutch in slipping_clutches:
+        if slip_clutch.engaged > 0.01:
+          g_left = gears[slip_clutch.left_gear_index]
+          g_right = gears[slip_clutch.right_gear_index]
+          
+          # Speed difference across clutch
+          speed_diff = g_left.speed - g_right.speed
+          
+          # Clutch torque (viscous damping model for slip)
+          # When fully engaged, acts like strong damper
+          # When slipping, transfers less torque
+          clutch_damping = slip_clutch.stiffness * slip_clutch.engaged
+          clutch_torque = clutch_damping * speed_diff
+          
+          # Limit to maximum clutch capacity
+          max_torque = slip_clutch.max_torque * slip_clutch.engaged
+          clutch_torque = max(-max_torque, min(max_torque, clutch_torque))
+          
+          # Apply equal and opposite torques
+          g_left.torque -= clutch_torque
+          g_right.torque += clutch_torque
+      
       for g in gears:
         g.speed += ((g.torque) - g.drag * g.speed) / g.inertia * (dt)
         g.angle += g.speed * (dt)
@@ -653,11 +792,93 @@ def main():
           clutch = dog_clutches[idx_c]
           engagement_offset = clutch.engaged * 30*scaling
 
-          pygame.draw.rect(screen, (150,50,50), (x-15*scaling + engagement_offset, y-15*scaling, 30*scaling, 30*scaling))      
+          pygame.draw.rect(screen, (150,50,50), (x-15*scaling + engagement_offset, y-15*scaling, 30*scaling, 30*scaling))
+        
+        # Draw slipping clutches (CP/CI)
+        if item in ['CP', 'CI']:
+          y = axle_displacement[i]
+          x = WINDOW_WIDTH/2 + (j * 150 + pan_offset[0]) * scaling
+          y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
+          pygame.draw.line(screen, (200,200,200), (x-75*scaling, y), (x+75*scaling, y), max(1, int(3*scaling)))
+          
+          c_offset = (j * 150, i * 150)
+          idx_c = next((index for index, c in enumerate(slipping_clutches) if c.offset == c_offset), None)
+          if idx_c is not None:
+            clutch = slipping_clutches[idx_c]
+            # Color based on engagement (0=green, 1=red)
+            color_val = int(255 * clutch.engaged)
+            color = (color_val, 255 - color_val, 50)
+            
+            # Draw clutch pack plates
+            plate_width = 25 * scaling
+            plate_height = 5 * scaling
+            spacing = 8 * scaling
+            for p in range(3):
+              offset_y = (p - 1) * spacing
+              pygame.draw.rect(screen, color, (x - plate_width/2, y + offset_y - plate_height/2, plate_width, plate_height))
+            
+            # Draw label
+            font = pygame.font.SysFont("Arial", int(12*scaling))
+            text = item
+            text_surface = font.render(text, True, (255, 255, 255))
+            screen.blit(text_surface, (x - 10*scaling, y - 35*scaling))      
 
     for g in gears:
       draw_gear(g, screen, module=1.8, scaling=scaling, pan_offset=pan_offset, axle_displacement=axle_displacement)
-
+    
+    # Debug mode: draw connection lines for hovered gear
+    if debug_mode:
+      # Find hovered gear
+      mx, my = pygame.mouse.get_pos()
+      hovered_gear_idx = None
+      
+      for idx, g in enumerate(gears):
+        center_x = WINDOW_WIDTH/2 + (g.offset[0] + pan_offset[0]) * scaling
+        center_y = WINDOW_HEIGHT/2 + (axle_displacement[g.offset[1]//150] + pan_offset[1]) * scaling
+        gear_radius = g.teeth * 1.8 * scaling
+        # Simple circular hit test
+        dx = mx - center_x
+        dy = my - center_y
+        if (dx*dx + dy*dy) < (gear_radius * gear_radius):
+          hovered_gear_idx = idx
+          break
+      
+      if hovered_gear_idx is not None:
+        # Highlight the hovered gear
+        g = gears[hovered_gear_idx]
+        center_x = WINDOW_WIDTH/2 + (g.offset[0] + pan_offset[0]) * scaling
+        center_y = WINDOW_HEIGHT/2 + (axle_displacement[g.offset[1]//150] + pan_offset[1]) * scaling
+        gear_radius = g.teeth * 1.8 * scaling
+        pygame.draw.circle(screen, (255, 255, 0), (int(center_x), int(center_y)), int(gear_radius), max(2, int(3*scaling)))
+        
+        # Draw outside connections (vertical, external mesh) in bright green
+        for idx1, idx2 in outside_conections:
+          if idx1 == hovered_gear_idx or idx2 == hovered_gear_idx:
+            g1 = gears[idx1]
+            g2 = gears[idx2]
+            x1 = WINDOW_WIDTH/2 + (g1.offset[0] + pan_offset[0]) * scaling
+            y1 = WINDOW_HEIGHT/2 + (axle_displacement[g1.offset[1]//150] + pan_offset[1]) * scaling
+            x2 = WINDOW_WIDTH/2 + (g2.offset[0] + pan_offset[0]) * scaling
+            y2 = WINDOW_HEIGHT/2 + (axle_displacement[g2.offset[1]//150] + pan_offset[1]) * scaling
+            pygame.draw.line(screen, (0, 255, 0), (int(x1), int(y1)), (int(x2), int(y2)), max(3, int(4*scaling)))
+        
+        # Draw axle connections (horizontal) in yellow-green
+        for idx1, idx2 in axle_conections:
+          if idx1 == hovered_gear_idx or idx2 == hovered_gear_idx:
+            g1 = gears[idx1]
+            g2 = gears[idx2]
+            x1 = WINDOW_WIDTH/2 + (g1.offset[0] + pan_offset[0]) * scaling
+            y1 = WINDOW_HEIGHT/2 + (axle_displacement[g1.offset[1]//150] + pan_offset[1]) * scaling
+            x2 = WINDOW_WIDTH/2 + (g2.offset[0] + pan_offset[0]) * scaling
+            y2 = WINDOW_HEIGHT/2 + (axle_displacement[g2.offset[1]//150] + pan_offset[1]) * scaling
+            pygame.draw.line(screen, (150, 255, 0), (int(x1), int(y1)), (int(x2), int(y2)), max(3, int(4*scaling)))
+        
+        # Draw gear name/info
+        font = pygame.font.SysFont("Arial", int(16*scaling) if scaling > 0.5 else 12)
+        info_text = f"{g.name} - {g.speed*60/(2*pi):.0f} RPM"
+        text_surface = font.render(info_text, True, (255, 255, 0))
+        screen.blit(text_surface, (int(center_x - 50*scaling), int(center_y - gear_radius - 25*scaling)))
+    
     draw_rpm_gauge(Engines, (260/2, 260/2), np.zeros((260, 260, 3), dtype=np.uint8))
     
     #print(f"{Engines[ENG].angle}%")
