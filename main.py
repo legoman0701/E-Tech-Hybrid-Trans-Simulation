@@ -4,7 +4,6 @@ from engine_curve import torque_from_omega
 import multiprocessing
 import cv2
 import numpy as np
-from carsim_cv2 import CarSim
 
 WINDOW_WIDTH, WINDOW_HEIGHT = 800, 600
 BACKGROUND_COLOR = (30, 30, 30)
@@ -17,7 +16,7 @@ class Gear:
     self.speed = 0
     self.angle = 0
     self.torque = 0
-    self.drag = 0.001
+    self.drag = 0.00005  # Reduced gear friction (bearing losses)
     self.offset = (0, 0)
     # Debug tracking
     self.last_constraint_force = 0.0
@@ -34,12 +33,14 @@ class DogClutch:
     
     # Synchronizer parameters
     self.sync_state = 0  # 0=disengaged, 1=syncing, 2=locked
-    self.sync_cone_friction_coef = 0.12  # Friction coefficient for synchro cone
+    self.sync_cone_friction_coef = 1.2  # Friction coefficient for synchro cone
     self.sync_cone_radius = 0.04  # Effective radius of cone friction surface (m)
     self.sync_force = 300  # Normal force applied by synchro springs (N)
     self.sync_tolerance = 5.0  # Speed difference tolerance for lockout (rad/s)
-    self.dog_engagement_speed = 0.0  # Current engagement speed (0-1)
-    self.dog_engagement_rate = 3.0  # How fast dogs engage once synced (1/s)
+    self.sync_engagement_progress = 0.0  # Tracks how engaged the synchro is (0-1)
+    self.sync_min_force_ratio = 0.3  # Minimum force ratio at start of engagement
+    self.sync_velocity_factor = 0.2  # How much velocity delta affects initial force
+    self.is_permanently_locked = False  # Once dogs fully engage, they stay locked
 
 class Clutch:
   def __init__(self):
@@ -73,7 +74,7 @@ class Engine:
     self.speed = 0
     self.angle = 0
     self.torque = 0
-    self.drag = 0.06
+    self.drag = 0.02  # Reduced engine friction
     self.tau0 = 10
     self.offset = (0, 0)
     self.throttle = 0
@@ -107,16 +108,42 @@ class TransESC:
         dog_clutches[i].engaged = 0
       return
 
-    if self.gear%2 == 0:
-      for i in self.dc_i:
-        dog_clutches[i].engaged = 0     
-      for i in self.dc_p:
-        dog_clutches[i].engaged = self.gears_p[(self.gear-1)//2][i]
+    # Check if we're at a half step (e.g., 1.5, 2.5, etc.)
+    is_half_step = (self.gear % 1) == 0.5
+    base_gear = int(self.gear)
+    
+    if is_half_step:
+      # Half step: engage both odd and even gears for smooth transition
+      if base_gear % 2 == 1:  # Transitioning from odd (e.g., 1.5 = gear 1 + gear 2)
+        # Engage current odd gear
+        for i in self.dc_i:
+          dog_clutches[i].engaged = self.gears_i[(base_gear-1)//2][i]
+        # Engage next even gear
+        next_even = base_gear + 1
+        if next_even < 8:
+          for i in self.dc_p:
+            dog_clutches[i].engaged = self.gears_p[(next_even-1)//2][i]
+      else:  # Transitioning from even (e.g., 2.5 = gear 2 + gear 3)
+        # Engage current even gear
+        for i in self.dc_p:
+          dog_clutches[i].engaged = self.gears_p[(base_gear-1)//2][i]
+        # Engage next odd gear
+        next_odd = base_gear + 1
+        if next_odd < 8:
+          for i in self.dc_i:
+            dog_clutches[i].engaged = self.gears_i[(next_odd-1)//2][i]
     else:
-      for i in self.dc_i:
-        dog_clutches[i].engaged = self.gears_i[(self.gear-1)//2][i]
-      for i in self.dc_p:
-        dog_clutches[i].engaged = 0
+      # Full step: normal single gear engagement
+      if int(self.gear) % 2 == 0:
+        for i in self.dc_i:
+          dog_clutches[i].engaged = 0     
+        for i in self.dc_p:
+          dog_clutches[i].engaged = self.gears_p[(int(self.gear)-1)//2][i]
+      else:
+        for i in self.dc_i:
+          dog_clutches[i].engaged = self.gears_i[(int(self.gear)-1)//2][i]
+        for i in self.dc_p:
+          dog_clutches[i].engaged = 0
 
 Engines = [None]*3
 displayed_numbers = [0, 1, 2, 3, 4, 5, 6]
@@ -128,6 +155,22 @@ Engines_ratios = [R2*FD, R3*FD, R4*FD]
 ENG, HSG, MEP = 0, 1, 2
 
 Engines[ENG] = Engine(0.12, "1.6l Engine") # Main Combustion Engine
+
+# Final drive and wheel parameters (Mini Countryman F60, manual)
+final_drive_ratio = 3.85  # plus court à cause du poids et du gabarit
+
+# Pneus très courants : 225/55 R17
+wheel_diameter = 0.679  # meters
+wheel_circumference = wheel_diameter * pi
+wheel_radius = wheel_diameter / 2
+
+# Vehicle physics parameters (Mini Countryman)
+vehicle_mass = 1560.0  # kg (curb ~1460 kg + driver/fuel)
+drag_coefficient = 0.265     # effective aerodynamic Cd
+frontal_area = 2.35         # m²
+rolling_resistance_coef = 0.015  # Typical for car tires on asphalt (can vary with tire type and condition)
+air_density = 1.225  # Air density in kg/m³ (at sea level, 15°C)
+gravity = 9.81  # Gravitational acceleration in m/s²
 
 def solve_gear_joint(g_in, g_out, ratio, s, dt, angle_offset, coef=1, Cdot_only=False):
     #C    = (1.0 * g_in.angle) + s * (ratio * g_out.angle)
@@ -227,6 +270,67 @@ def draw_rpm_gauge(Engines, pos, screen):
 
   return screen
 
+def draw_speed_gauge(gears, final_drive_ratio, wheel_circumference, pos, screen):
+  # screen is expected to be a numpy array (cv2 image)
+  # pos is (cx, cy) center of the gauge
+  cx, cy = pos
+  radius = 100
+  thickness = 5
+  font_scale = 1
+  font = cv2.FONT_HERSHEY_SIMPLEX
+  
+  # Find the 52#C gear (final drive input)
+  output_gear = None
+  for g in gears:
+    if g.name == "52#C":
+      output_gear = g
+      break
+  
+  if output_gear is None:
+    return screen
+  
+  # Calculate wheel speed from gear speed
+  # gear speed (rad/s) -> wheel speed (rad/s) -> linear speed (m/s) -> speed (km/h)
+  wheel_speed_rad = output_gear.speed / final_drive_ratio
+  linear_speed_ms = wheel_speed_rad * (wheel_circumference / (2 * np.pi))
+  speed_kmh = linear_speed_ms * 3.6  # Convert m/s to km/h
+  
+  # Draw main arc (white) - 0 to 200 km/h
+  cv2.ellipse(
+    screen, (int(cx), int(cy)), (radius, radius),
+    angle=0, startAngle=0, endAngle=int(-1.25*180),
+    color=(255, 255, 255), thickness=thickness, lineType=cv2.LINE_AA
+  )
+  
+  # Draw numbers (0, 40, 80, 120, 160, 200)
+  speed_numbers = [0, 40, 80, 120, 160, 200]
+  speed_numbers.reverse()
+  for i, number in enumerate(speed_numbers):
+    alpha = -i/5 * 1.25 * np.pi
+    offset_x = int(np.cos(alpha) * 120)
+    offset_y = int(np.sin(alpha) * 120)
+    text = str(number)
+    (tw, th), _ = cv2.getTextSize(text, font, font_scale*0.5, 2)
+    tx = int(cx + offset_x - tw // 2)
+    ty = int(cy + offset_y + th // 2)
+    cv2.putText(screen, text, (tx, ty), font, font_scale*0.5, (255, 255, 255), 2, cv2.LINE_AA)
+  
+  # Draw needle
+  alpha = speed_kmh / 200 * 5  # Map 0-200 km/h to 0-5 units
+  alpha *= 1.25 * np.pi / 5
+  alpha -= 1.25 * np.pi
+  needle_x = int(cx + np.cos(alpha) * 90)
+  needle_y = int(cy + np.sin(alpha) * 90)
+  cv2.line(screen, (int(cx), int(cy)), (needle_x, needle_y), (255, 255, 255), 3, cv2.LINE_AA)
+  
+  # Draw "km/h" label
+  cv2.putText(screen, "km/h", (int(cx - 25), int(cy + 30)), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+  
+  cv2.imshow("Speed Gauge", screen)
+  cv2.waitKey(1)
+  
+  return screen
+
 def check_if_gear(item):
     """Check if an item in the grid represents a gear."""
     if item == 'DC' or item in ['CP', 'CI'] or item[0] == 'C':
@@ -293,9 +397,17 @@ def load_gears_from_file(filename="gears DCT.txt", Engines=[]):
                 teeth = int(item[:-2])
                 inertia = teeth * teeth / 1000000
                 gear = Gear(teeth, inertia, item)
-                if item == "52#C":
-                  gear.inertia *= 50
                 gear.offset = get_offset(col_idx, row_idx)
+                
+                # Add vehicle inertia to output gear (52#C)
+                if item == "52#C":
+                    # Calculate equivalent inertia of vehicle mass reflected to output shaft
+                    # I_equivalent = m * r² / (gear_ratio²)
+                    # Use a scaling factor (0.15) to account for suspension, wheel inertia, etc.
+                    inertia_scale_factor = 0.15
+                    vehicle_inertia_reflected = inertia_scale_factor * vehicle_mass * (wheel_radius ** 2) / (final_drive_ratio ** 2)
+                    gear.inertia = inertia + vehicle_inertia_reflected
+                
                 gears.append(gear)
     
     # Step 2: Add vertical (external mesh) connections
@@ -557,13 +669,27 @@ last_mouse_pos = (0, 0)
 debug_mode = False
 
 def main():
-  global scaling, pan_offset, is_panning, last_mouse_pos, error_tot, debug_mode
+  global scaling, pan_offset, is_panning, last_mouse_pos, error_tot, debug_mode, final_drive_ratio
+  global vehicle_mass, drag_coefficient, frontal_area, rolling_resistance_coef
   dt = 1/60
   debut = time.time()
   
   gears, outside_conections, axle_conections, dog_clutches, axle_displacement, result, clutches, slipping_clutches = load_gears_from_file(Engines=Engines)
 
   DCT_Trans = TransESC()
+  DCT_Trans.gear = 1  # Start in first gear
+  
+  # Engage both DCT clutches at startup (both shafts ready)
+  if len(slipping_clutches) >= 2:
+    slipping_clutches[0].engaged = 1.0  # Engage odd shaft clutch (CP)
+    slipping_clutches[1].engaged = 1.0  # Engage even shaft clutch (CI)
+  
+  # DCT automatic shifting parameters
+  auto_shift_enabled = True
+  shift_up_rpm = 5500
+  shift_down_rpm = 3000
+  shift_delay = 0.0  # Time since last shift (prevents rapid shifting)
+  shift_cooldown = 1  # Minimum time between shifts (seconds)
   
   pygame.init()
   screen = pygame.display.set_mode((800, 600))
@@ -583,13 +709,35 @@ def main():
       if event.type == pygame.KEYDOWN:
         if event.key == pygame.K_d:
           debug_mode = not debug_mode
-        if event.key == pygame.K_z:DCT_Trans.gear+=1
-        if event.key == pygame.K_s:DCT_Trans.gear-=1
+        if event.key == pygame.K_z:
+          DCT_Trans.gear += 0.5  # Half-step increment
+          auto_shift_enabled = False  # Disable auto when manually shifting
+        if event.key == pygame.K_s:
+          DCT_Trans.gear -= 0.5  # Half-step decrement
+          auto_shift_enabled = False  # Disable auto when manually shifting
+        if event.key == pygame.K_x:
+          DCT_Trans.gear = round(DCT_Trans.gear + 1)  # Full gear up
+          auto_shift_enabled = False  # Disable auto when manually shifting
+        if event.key == pygame.K_a:
+          DCT_Trans.gear = round(DCT_Trans.gear - 1)  # Full gear down
+          auto_shift_enabled = False  # Disable auto when manually shifting
+        if event.key == pygame.K_t:
+          auto_shift_enabled = not auto_shift_enabled  # Toggle automatic shifting
         # Slipping clutch controls
         if event.key == pygame.K_1 and len(slipping_clutches) > 0:
           slipping_clutches[0].engaged = 1.0 if slipping_clutches[0].engaged == 0 else 0.0
         if event.key == pygame.K_2 and len(slipping_clutches) > 1:
           slipping_clutches[1].engaged = 1.0 if slipping_clutches[1].engaged == 0 else 0.0
+        # Final drive ratio controls
+        if event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
+          final_drive_ratio += 0.1
+        if event.key == pygame.K_MINUS:
+          final_drive_ratio = max(0.5, final_drive_ratio - 0.1)
+        # Vehicle mass controls
+        if event.key == pygame.K_m:
+          vehicle_mass += 50  # Increase mass by 50 kg
+        if event.key == pygame.K_n:
+          vehicle_mass = max(500, vehicle_mass - 50)  # Decrease mass by 50 kg
         
       # Zoom with mouse wheel
       if event.type == pygame.MOUSEBUTTONDOWN:
@@ -645,6 +793,33 @@ def main():
     if Engines[ENG].speed*60/(2*pi) > Engines[ENG].rev_cut: Engines[ENG].rev_limit_activated = True
     elif Engines[ENG].speed*60/(2*pi) < Engines[ENG].rev_act and Engines[ENG].rev_limit_activated: Engines[ENG].rev_limit_activated = False
 
+    # DCT Automatic Shifting Logic
+    if auto_shift_enabled and shift_delay <= 0:
+      engine_rpm = Engines[ENG].speed * 60 / (2 * pi)
+      
+      # Upshift at shift_up_rpm
+      if engine_rpm > shift_up_rpm and DCT_Trans.gear < 7:
+        # Use half-step shifting for smooth DCT operation
+        DCT_Trans.gear += 1
+        shift_delay = shift_cooldown
+        print(clutches)
+        if DCT_Trans.gear%2 == 0:  # Even gear - engage even shaft clutch, disengage odd shaft clutch
+          slipping_clutches[0].engaged = 0.0
+          slipping_clutches[1].engaged = 1.0
+        else:  # Odd gear - engage odd shaft clutch, disengage even shaft clutch
+          slipping_clutches[0].engaged = 1.0
+          slipping_clutches[1].engaged = 0.0
+        
+      # Downshift at shift_down_rpm
+      elif engine_rpm < shift_down_rpm and DCT_Trans.gear > 1:
+        # Use half-step shifting for smooth DCT operation
+        DCT_Trans.gear -= 0.5
+        shift_delay = shift_cooldown
+    
+    # Update shift delay timer
+    if shift_delay > 0:
+      shift_delay -= dt
+
     s = +1.0            # +1 external mesh, -1 internal/belt
       
     #dt = min(1/300, dt)
@@ -669,6 +844,8 @@ def main():
           dog_clutch.old_engaged = 0
           dog_clutch.sync_state = 0
           dog_clutch.dog_engagement_speed = 0.0
+          dog_clutch.sync_engagement_progress = 0.0
+          dog_clutch.is_permanently_locked = False
           continue
         
         g1 = gears[dog_clutch.left_gear_index]
@@ -692,12 +869,27 @@ def main():
           # Just started engaging - reset to syncing state
           dog_clutch.sync_state = 1
           dog_clutch.dog_engagement_speed = 0.0
+          dog_clutch.sync_engagement_progress = 0.0
           dog_clutch.angle_offset = target_gear.angle - g3.angle
           dog_clutch.old_engaged = dog_clutch.engaged
         
         if dog_clutch.sync_state == 1:  # Syncing phase
-          # Apply synchro cone friction torque
-          sync_torque = dog_clutch.sync_cone_friction_coef * dog_clutch.sync_force * dog_clutch.sync_cone_radius
+          # Calculate engagement progress based on velocity difference
+          # As velocity difference decreases, engagement increases
+          # Use an exponential decay curve for smooth transition
+          max_speed_diff = 200.0  # rad/s - reference speed difference
+          dog_clutch.sync_engagement_progress = 1.0 - min(1.0, speed_diff / max_speed_diff)
+          
+          # Calculate progressive friction force
+          # Start with small force based on velocity delta, increase with engagement progress
+          velocity_based_force = dog_clutch.sync_min_force_ratio + (speed_diff * dog_clutch.sync_velocity_factor)
+          velocity_based_force = min(velocity_based_force, 1.0)  # Cap at 100%
+          
+          # Blend between velocity-based and full force as engagement progresses
+          force_ratio = velocity_based_force + (1.0 - velocity_based_force) * dog_clutch.sync_engagement_progress
+          
+          # Calculate synchro cone friction torque with progressive force
+          sync_torque = force_ratio * dog_clutch.sync_cone_friction_coef * dog_clutch.sync_force * dog_clutch.sync_cone_radius
           
           # Direction of friction torque (always opposes speed difference)
           friction_direction = 1.0 if target_gear.speed > g3.speed else -1.0
@@ -711,30 +903,71 @@ def main():
             dog_clutch.sync_state = 2  # Move to locked state
         
         if dog_clutch.sync_state == 2:  # Locked/engaging phase
-          # Gradually engage dog clutch
-          dog_clutch.dog_engagement_speed = min(1.0, dog_clutch.dog_engagement_speed + dog_clutch.dog_engagement_rate * dt)
+          # Once in locked state, continue increasing engagement progress
+          # Don't recalculate based on speed_diff - maintain forward progress
+          max_speed_diff = 200.0
+          current_progress = 1.0 - min(1.0, speed_diff / max_speed_diff)
+          # Only allow progress to increase, never decrease
+          dog_clutch.sync_engagement_progress = max(dog_clutch.sync_engagement_progress, current_progress)
           
-          # Apply constraint with engagement strength
-          engagement_strength = dog_clutch.dog_engagement_speed
+          engagement_strength = dog_clutch.sync_engagement_progress
           
-          if engagement_strength < 1.0:
-            # Partial engagement - use velocity constraint only
-            solve_gear_joint(target_gear, g3, 1.0, -s, dt, dog_clutch.angle_offset, coef=engagement_strength, Cdot_only=True)
-            
-            # Only allow fallback to syncing if dogs aren't fully engaged yet
-            # Once fully engaged (100%), dogs are mechanically locked and can't disengage
-            if speed_diff > dog_clutch.sync_tolerance * 3.0:
-              dog_clutch.sync_state = 1
-              dog_clutch.dog_engagement_speed = 0.0
-          else:
-            # Full engagement - dogs are mechanically locked, use strong position constraint
-            # Dogs cannot disengage once fully locked - they're physically interlocked
+          # Check if we've reached full lock
+          if engagement_strength >= 1.0 and not dog_clutch.is_permanently_locked:
+            dog_clutch.is_permanently_locked = True
+            # Update angle offset at the moment of permanent lock
+            dog_clutch.angle_offset = target_gear.angle - g3.angle
+          
+          if dog_clutch.is_permanently_locked:
+            # Permanently locked - dogs are mechanically interlocked
+            # Use full position constraint (both C and Cdot)
             solve_gear_joint(target_gear, g3, 1.0, -s, dt, dog_clutch.angle_offset)
+          else:
+            # Partial engagement - use velocity constraint scaled by engagement
+            solve_gear_joint(target_gear, g3, 1.0, -s, dt, dog_clutch.angle_offset, coef=engagement_strength, Cdot_only=True)
+            # No fallback once in state 2 - dogs are engaging and won't back out
       
       for engine in Engines:
         if engine == None: continue
         g1 = gears[engine.conected_gear_index]
         solve_gear_joint(engine, g1, 1.0, -s, dt, 0)
+      
+      # Apply vehicle load resistance to output gear (52#C)
+      output_gear = None
+      output_gear_idx = None
+      for idx, g in enumerate(gears):
+        if g.name == "52#C":
+          output_gear = g
+          output_gear_idx = idx
+          break
+      
+      if output_gear is not None:
+        # Calculate vehicle speed from output gear speed
+        wheel_speed_rad = output_gear.speed / final_drive_ratio
+        vehicle_velocity = wheel_speed_rad * wheel_radius  # m/s
+        
+        # Only apply resistance if vehicle is moving
+        if abs(vehicle_velocity) > 0.01:  # Threshold to avoid numerical issues
+          # Calculate rolling resistance force: F_roll = C_rr * m * g
+          rolling_force = rolling_resistance_coef * vehicle_mass * gravity
+          
+          # Calculate aerodynamic drag force: F_aero = 0.5 * ρ * Cd * A * v²
+          aero_force = 0.5 * air_density * drag_coefficient * frontal_area * (vehicle_velocity ** 2)
+          
+          # Total resistance force at the wheels
+          total_resistance_force = rolling_force + aero_force
+          
+          # Calculate torque at wheels: T_wheel = F * r
+          wheel_torque = total_resistance_force * wheel_radius
+          
+          # Reflect torque to output shaft through final drive
+          # Power conservation: T_output * ω_output = T_wheel * ω_wheel
+          # Since ω_wheel = ω_output / final_drive_ratio
+          # Therefore: T_output = T_wheel / final_drive_ratio
+          output_shaft_resistance_torque = wheel_torque / final_drive_ratio
+          
+          # Apply resistance torque (opposes motion)
+          output_gear.torque -= output_shaft_resistance_torque * copysign(1, output_gear.speed)
       
       # Apply slipping clutch constraints (velocity-based when slipping, position-based when locked)
       for slip_clutch in slipping_clutches:
@@ -845,8 +1078,8 @@ def main():
           elif clutch.sync_state == 1:
             color = (255, 200, 0)  # Yellow - syncing
           else:  # clutch.sync_state == 2
-            # Blend from yellow to green based on engagement speed
-            green_amount = int(clutch.dog_engagement_speed * 255)
+            # Blend from yellow to green based on engagement progress
+            green_amount = int(clutch.sync_engagement_progress * 255)
             yellow_amount = 255 - green_amount
             color = (yellow_amount, 255, 0)  # Yellow to green
           
@@ -861,9 +1094,8 @@ def main():
             # Background
             pygame.draw.rect(screen, (50, 50, 50), (bar_x, bar_y, bar_width, bar_height))
             # Progress
-            if clutch.sync_state == 2:
-              progress_width = bar_width * clutch.dog_engagement_speed
-              pygame.draw.rect(screen, (0, 255, 0), (bar_x, bar_y, progress_width, bar_height))
+            progress_width = bar_width * clutch.sync_engagement_progress
+            pygame.draw.rect(screen, (0, 255, 0), (bar_x, bar_y, progress_width, bar_height))
         
         # Draw slipping clutches (CP/CI)
         if item in ['CP', 'CI']:
@@ -1014,7 +1246,7 @@ def main():
           f"Dog Clutch #{hovered_dog_clutch_idx}",
           f"Engaged: {dc.engaged} ({['Neutral','Left','Right'][dc.engaged+1]})",
           f"State: {sync_state_names[dc.sync_state]}",
-          f"Engagement: {dc.dog_engagement_speed*100:.1f}%",
+          f"Sync Progress: {dc.sync_engagement_progress*100:.1f}%",
           f"Speed diff: {speed_diff:.2f} rad/s ({speed_diff*60/(2*pi):.0f} RPM)",
           f"Left gear: {g_left.name} ({g_left.speed*60/(2*pi):.0f} RPM)",
           f"Right gear: {g_right.name} ({g_right.speed*60/(2*pi):.0f} RPM)",
@@ -1090,6 +1322,7 @@ def main():
           screen.blit(text_surface, (10, 70 + i*18))
     
     draw_rpm_gauge(Engines, (260/2, 260/2), np.zeros((260, 260, 3), dtype=np.uint8))
+    draw_speed_gauge(gears, final_drive_ratio, wheel_circumference, (260/2, 260/2), np.zeros((260, 260, 3), dtype=np.uint8))
     
     #print(f"{Engines[ENG].angle}%")
       
@@ -1098,8 +1331,33 @@ def main():
     text_surface = font.render(f"FPS: {fps:.2f}", True, (255, 255, 255))
     screen.blit(text_surface, (10, 10))
     
-    text_surface = font.render(f"Gear: {DCT_Trans.gear}", True, (255, 255, 255))
+    text_surface = font.render(f"Gear: {DCT_Trans.gear:.1f}", True, (255, 255, 255))
     screen.blit(text_surface, (10, 40))
+    
+    text_surface = font.render(f"Final Drive: {final_drive_ratio:.1f}", True, (255, 255, 255))
+    screen.blit(text_surface, (10, 70))
+    
+    text_surface = font.render(f"Vehicle Mass: {vehicle_mass:.0f} kg", True, (255, 255, 255))
+    screen.blit(text_surface, (10, 100))
+    
+    # Calculate and display current vehicle speed
+    output_gear = None
+    for g in gears:
+      if g.name == "52#C":
+        output_gear = g
+        break
+    if output_gear is not None:
+      wheel_speed_rad = output_gear.speed / final_drive_ratio
+      vehicle_velocity = wheel_speed_rad * wheel_radius
+      speed_kmh = vehicle_velocity * 3.6
+      text_surface = font.render(f"Speed: {speed_kmh:.1f} km/h", True, (255, 255, 255))
+      screen.blit(text_surface, (10, 130))
+    
+    # Display auto shift mode status
+    auto_shift_text = "AUTO" if auto_shift_enabled else "MANUAL"
+    auto_shift_color = (0, 255, 0) if auto_shift_enabled else (255, 100, 100)
+    text_surface = font.render(f"Mode: {auto_shift_text} (T)", True, auto_shift_color)
+    screen.blit(text_surface, (10, 160))
 
     pygame.display.flip()
     

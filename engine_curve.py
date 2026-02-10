@@ -11,21 +11,24 @@ def rpm_to_rad_s(rpm: Number) -> float:
     return (float(rpm) * 2.0 * math.pi) / 60.0
 
 # Default WOT ICE-only curve as a DICTIONARY: {omega(rad/s): torque(Nm)}
+# Sporty 1.6L turbo engine - ~145 kW (195 hp) peak power
 DEFAULT_CURVE: Dict[float, float] = {
     rpm_to_rad_s(0):    0.0,
-    rpm_to_rad_s(400):  45.0,
-    rpm_to_rad_s(800):  75.0,
-    rpm_to_rad_s(1000): 95.0,
-    rpm_to_rad_s(1500): 110.0,
-    rpm_to_rad_s(2000): 130.0,
-    rpm_to_rad_s(2500): 142.0,
-    rpm_to_rad_s(3200): 148.0,   # peak
-    rpm_to_rad_s(4000): 135.0,
-    rpm_to_rad_s(5000): 123.0,
-    rpm_to_rad_s(5600): 118.0,   # ≈69 kW anchor
-    rpm_to_rad_s(6000): 110.0,
-    rpm_to_rad_s(6500): 90.0,
-    rpm_to_rad_s(7000): 80.0,
+    rpm_to_rad_s(400):  80.0,
+    rpm_to_rad_s(800):  130.0,
+    rpm_to_rad_s(1000): 170.0,
+    rpm_to_rad_s(1500): 220.0,   # plateau starts
+    rpm_to_rad_s(2000): 220.0,
+    rpm_to_rad_s(2500): 220.0,
+    rpm_to_rad_s(3000): 220.0,
+    rpm_to_rad_s(3500): 220.0,
+    rpm_to_rad_s(4100): 220.0,   # plateau ends
+    rpm_to_rad_s(4500): 210.0,
+    rpm_to_rad_s(5000): 195.0,
+    rpm_to_rad_s(5600): 170.0,   # ~100 kW anchor
+    rpm_to_rad_s(6000): 155.0,
+    rpm_to_rad_s(6500): 135.0,
+    rpm_to_rad_s(6800): 115.0,
 }
 
 def _prepare_xy_m(curve_dict: Dict[float, float]):
