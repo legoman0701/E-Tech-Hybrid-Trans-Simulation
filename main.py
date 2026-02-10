@@ -19,6 +19,8 @@ class Gear:
     self.torque = 0
     self.drag = 0.001
     self.offset = (0, 0)
+    # Debug tracking
+    self.last_constraint_force = 0.0
 
 class DogClutch:
   def __init__(self):
@@ -29,6 +31,15 @@ class DogClutch:
     self.right_gear_index = 0
     self.right_most_axle_conected_gear_index = 0
     self.offset = (0, 0)
+    
+    # Synchronizer parameters
+    self.sync_state = 0  # 0=disengaged, 1=syncing, 2=locked
+    self.sync_cone_friction_coef = 0.12  # Friction coefficient for synchro cone
+    self.sync_cone_radius = 0.04  # Effective radius of cone friction surface (m)
+    self.sync_force = 300  # Normal force applied by synchro springs (N)
+    self.sync_tolerance = 5.0  # Speed difference tolerance for lockout (rad/s)
+    self.dog_engagement_speed = 0.0  # Current engagement speed (0-1)
+    self.dog_engagement_rate = 3.0  # How fast dogs engage once synced (1/s)
 
 class Clutch:
   def __init__(self):
@@ -47,6 +58,13 @@ class SlippingClutch:
     self.clutch_type = clutch_type  # 'P' for pair, 'I' for impair
     self.max_torque = 500.0  # Maximum torque the clutch can transfer [N·m]
     self.stiffness = 50.0  # Clutch spring stiffness
+    self.is_locked = False  # True when speeds are matched and clutch is fully locked
+    self.angle_offset = 0.0  # Angle offset when locked
+    self.lock_tolerance = 10.0  # Speed difference tolerance for locking (rad/s)
+    # Debug tracking
+    self.last_C = 0.0
+    self.last_Cdot = 0.0
+    self.last_lambda = 0.0
 
 class Engine:
   def __init__(self, inertia, name):
@@ -74,21 +92,31 @@ class Engine:
 
 class TransESC:
   def __init__(self):
-    self.gears_p = [[0, -1], [0, 1], [1, 0]]
-    self.gears_i = [[0, 1], [0, -1], [1, 0], [-1, 0]]
+    self.gears_p = [[0, 0, -1, 0], [0, 0,  1, 0], [1, 0, 0, 0]]
+    self.gears_i = [[0, 0, 0, 1], [0, 0, 0, -1], [0, 1, 0, 0], [0, -1, 0, 0]]
     self.dc_p = [0, 2]
     self.dc_i = [1, 3]
     self.gear = 0
+    self.gear_i = 0
   
   def set_gear(self, dog_clutches):
-    if self.gear < 0 or self.gear >= 8:
+    if self.gear < 1 or self.gear >= 8:
+      for i in self.dc_i:
+        dog_clutches[i].engaged = 0     
+      for i in self.dc_p:
+        dog_clutches[i].engaged = 0
       return
 
     if self.gear%2 == 0:
-      for i in range(len(self.dc_p)):
-        dog_clutches[i].engaged = self.gears_p[(self.gear-1)//2][i]
-      for i in range(len(self.dc_i)):
+      for i in self.dc_i:
         dog_clutches[i].engaged = 0     
+      for i in self.dc_p:
+        dog_clutches[i].engaged = self.gears_p[(self.gear-1)//2][i]
+    else:
+      for i in self.dc_i:
+        dog_clutches[i].engaged = self.gears_i[(self.gear-1)//2][i]
+      for i in self.dc_p:
+        dog_clutches[i].engaged = 0
 
 Engines = [None]*3
 displayed_numbers = [0, 1, 2, 3, 4, 5, 6]
@@ -104,19 +132,22 @@ Engines[ENG] = Engine(0.12, "1.6l Engine") # Main Combustion Engine
 def solve_gear_joint(g_in, g_out, ratio, s, dt, angle_offset, coef=1, Cdot_only=False):
     #C    = (1.0 * g_in.angle) + s * (ratio * g_out.angle)
     C = 0
-    if coef != 1 or Cdot_only:
-      C = solve_gear_c(g_in, g_out, ratio, s, dt, 30, angle_offset)
+    if not Cdot_only:
+      C = solve_gear_c(g_in, g_out, ratio, s, dt, 400, angle_offset)
     #Cdot = (1.0 * g_in.speed) + s * (ratio * g_out.speed)
     Cdot = solve_gear_cdot(g_in, g_out, ratio, s, dt)
-    lam  =  (C + Cdot)*coef
+    lam  =  (C + Cdot)
     if Cdot_only:
-      lam = min(max(Cdot, -100), 100)
+      lam = min(max(Cdot, -10000), 10000)*coef
     #lam  = Cdot
     global error_tot
     error_tot += abs(C)
     
     g_in.torque -= 1.0 * lam
     g_out.torque -= s*ratio * lam
+    
+    # Return constraint values for debug tracking
+    return C, Cdot, lam
 
 def solve_gear_cdot(g_in, g_out, ratio, s, dt, strength=0.7):
     I1, I2 = g_in.inertia, g_out.inertia
@@ -262,6 +293,8 @@ def load_gears_from_file(filename="gears DCT.txt", Engines=[]):
                 teeth = int(item[:-2])
                 inertia = teeth * teeth / 1000000
                 gear = Gear(teeth, inertia, item)
+                if item == "52#C":
+                  gear.inertia *= 50
                 gear.offset = get_offset(col_idx, row_idx)
                 gears.append(gear)
     
@@ -634,41 +667,111 @@ def main():
       for dog_clutch in dog_clutches:
         if dog_clutch.engaged == 0:
           dog_clutch.old_engaged = 0
+          dog_clutch.sync_state = 0
+          dog_clutch.dog_engagement_speed = 0.0
           continue
+        
         g1 = gears[dog_clutch.left_gear_index]
         g2 = gears[dog_clutch.right_gear_index]
         g3 = gears[dog_clutch.right_most_axle_conected_gear_index]
         ratio = 1.0
-        sync_speed_threshold = 60.0  # rad/s; use soft sync if mismatched
-
+        
+        # Determine target gear based on engagement direction
         if dog_clutch.engaged == -1:
-          if dog_clutch.old_engaged != -1:
-            dog_clutch.angle_offset = g1.angle - g3.angle
-            dog_clutch.old_engaged = -1
-          if abs(g1.speed - g3.speed) > sync_speed_threshold:
-            solve_gear_joint(g1, g3, 1.0, -s, dt, dog_clutch.angle_offset, Cdot_only=True)
+          target_gear = g1
+          target_gear_index = dog_clutch.left_gear_index
+        else:  # dog_clutch.engaged == +1
+          target_gear = g2
+          target_gear_index = dog_clutch.right_gear_index
+        
+        # Calculate speed difference
+        speed_diff = abs(target_gear.speed - g3.speed)
+        
+        # Synchronizer state machine
+        if dog_clutch.old_engaged != dog_clutch.engaged:
+          # Just started engaging - reset to syncing state
+          dog_clutch.sync_state = 1
+          dog_clutch.dog_engagement_speed = 0.0
+          dog_clutch.angle_offset = target_gear.angle - g3.angle
+          dog_clutch.old_engaged = dog_clutch.engaged
+        
+        if dog_clutch.sync_state == 1:  # Syncing phase
+          # Apply synchro cone friction torque
+          sync_torque = dog_clutch.sync_cone_friction_coef * dog_clutch.sync_force * dog_clutch.sync_cone_radius
+          
+          # Direction of friction torque (always opposes speed difference)
+          friction_direction = 1.0 if target_gear.speed > g3.speed else -1.0
+          
+          # Apply friction torque to both gears
+          target_gear.torque -= sync_torque * friction_direction
+          g3.torque += sync_torque * friction_direction
+          
+          # Check if synchronized (within tolerance)
+          if speed_diff < dog_clutch.sync_tolerance:
+            dog_clutch.sync_state = 2  # Move to locked state
+        
+        if dog_clutch.sync_state == 2:  # Locked/engaging phase
+          # Gradually engage dog clutch
+          dog_clutch.dog_engagement_speed = min(1.0, dog_clutch.dog_engagement_speed + dog_clutch.dog_engagement_rate * dt)
+          
+          # Apply constraint with engagement strength
+          engagement_strength = dog_clutch.dog_engagement_speed
+          
+          if engagement_strength < 1.0:
+            # Partial engagement - use velocity constraint only
+            solve_gear_joint(target_gear, g3, 1.0, -s, dt, dog_clutch.angle_offset, coef=engagement_strength, Cdot_only=True)
+            
+            # Only allow fallback to syncing if dogs aren't fully engaged yet
+            # Once fully engaged (100%), dogs are mechanically locked and can't disengage
+            if speed_diff > dog_clutch.sync_tolerance * 3.0:
+              dog_clutch.sync_state = 1
+              dog_clutch.dog_engagement_speed = 0.0
           else:
-            solve_gear_joint(g1, g3, 1.0, -s, dt, dog_clutch.angle_offset)
-        if dog_clutch.engaged == +1:
-          if dog_clutch.old_engaged != +1:
-            dog_clutch.angle_offset = g2.angle - g3.angle
-            dog_clutch.old_engaged = +1
-          if abs(g2.speed - g3.speed) > sync_speed_threshold:
-            solve_gear_joint(g2, g3, 1.0, -s, dt, dog_clutch.angle_offset, Cdot_only=True)
-          else:
-            solve_gear_joint(g2, g3, 1.0, -s, dt, dog_clutch.angle_offset)
+            # Full engagement - dogs are mechanically locked, use strong position constraint
+            # Dogs cannot disengage once fully locked - they're physically interlocked
+            solve_gear_joint(target_gear, g3, 1.0, -s, dt, dog_clutch.angle_offset)
       
       for engine in Engines:
         if engine == None: continue
         g1 = gears[engine.conected_gear_index]
         solve_gear_joint(engine, g1, 1.0, -s, dt, 0)
       
-      # Apply slipping clutch constraints (torque-based, not position-based)
+      # Apply slipping clutch constraints (velocity-based when slipping, position-based when locked)
       for slip_clutch in slipping_clutches:
         if slip_clutch.engaged > 0.01:
           g_left = gears[slip_clutch.left_gear_index]
           g_right = gears[slip_clutch.right_gear_index]
-          solve_gear_joint(g_left, g_right, 1.0, -s, dt, 0, coef=1, Cdot_only=True)
+          
+          # Calculate speed difference
+          speed_diff = abs(g_left.speed - g_right.speed)
+          
+          # Check if clutch should lock (speeds matched)
+          if not slip_clutch.is_locked and speed_diff < slip_clutch.lock_tolerance:
+            slip_clutch.is_locked = True
+            slip_clutch.angle_offset = g_left.angle - g_right.angle
+          
+          # Once locked, clutch stays locked - mechanical friction holds plates together
+          # Only unlock if clutch is fully disengaged
+          
+          # Apply appropriate constraint based on lock state
+          if slip_clutch.is_locked:
+            # Locked - use position constraint (C and Cdot)
+            # Plates are compressed together and rotate as one unit
+            C, Cdot, lam = solve_gear_joint(g_left, g_right, 1.0, -s, dt, slip_clutch.angle_offset, coef=1)
+            slip_clutch.last_C = C
+            slip_clutch.last_Cdot = Cdot
+            slip_clutch.last_lambda = lam
+          else:
+            # Slipping - use velocity constraint scaled by engagement
+            # More engagement = stronger friction = faster speed matching
+            engagement_strength = slip_clutch.engaged
+            C, Cdot, lam = solve_gear_joint(g_left, g_right, 1.0, -s, dt, 0, coef=engagement_strength, Cdot_only=True)
+            slip_clutch.last_C = C
+            slip_clutch.last_Cdot = Cdot
+            slip_clutch.last_lambda = lam
+        else:
+          # Reset lock state when disengaged
+          slip_clutch.is_locked = False
       
       for g in gears:
         inertia = g.inertia if isfinite(g.inertia) and g.inertia > 1e-8 else 1e-8
@@ -736,7 +839,31 @@ def main():
           clutch = dog_clutches[idx_c]
           engagement_offset = clutch.engaged * 30*scaling
 
-          pygame.draw.rect(screen, (150,50,50), (x-15*scaling + engagement_offset, y-15*scaling, 30*scaling, 30*scaling))
+          # Color based on sync state: 0=gray(disengaged), 1=yellow(syncing), 2=green(locked)
+          if clutch.sync_state == 0:
+            color = (100, 100, 100)  # Gray - disengaged
+          elif clutch.sync_state == 1:
+            color = (255, 200, 0)  # Yellow - syncing
+          else:  # clutch.sync_state == 2
+            # Blend from yellow to green based on engagement speed
+            green_amount = int(clutch.dog_engagement_speed * 255)
+            yellow_amount = 255 - green_amount
+            color = (yellow_amount, 255, 0)  # Yellow to green
+          
+          pygame.draw.rect(screen, color, (x-15*scaling + engagement_offset, y-15*scaling, 30*scaling, 30*scaling))
+          
+          # Draw engagement progress bar when syncing/engaging
+          if clutch.sync_state > 0:
+            bar_width = 60 * scaling
+            bar_height = 5 * scaling
+            bar_x = x - bar_width/2
+            bar_y = y + 25*scaling
+            # Background
+            pygame.draw.rect(screen, (50, 50, 50), (bar_x, bar_y, bar_width, bar_height))
+            # Progress
+            if clutch.sync_state == 2:
+              progress_width = bar_width * clutch.dog_engagement_speed
+              pygame.draw.rect(screen, (0, 255, 0), (bar_x, bar_y, progress_width, bar_height))
         
         # Draw slipping clutches (CP/CI)
         if item in ['CP', 'CI']:
@@ -770,58 +897,197 @@ def main():
     for g in gears:
       draw_gear(g, screen, module=1.8, scaling=scaling, pan_offset=pan_offset, axle_displacement=axle_displacement)
     
-    # Debug mode: draw connection lines for hovered gear
+    # Debug mode: draw connection lines and detailed stats for hovered items
     if debug_mode:
-      # Find hovered gear
       mx, my = pygame.mouse.get_pos()
       hovered_gear_idx = None
+      hovered_dog_clutch_idx = None
+      hovered_slip_clutch_idx = None
+      hovered_engine = None
       
+      # Check for hovered gear
       for idx, g in enumerate(gears):
         center_x = WINDOW_WIDTH/2 + (g.offset[0] + pan_offset[0]) * scaling
         center_y = WINDOW_HEIGHT/2 + (axle_displacement[g.offset[1]//150] + pan_offset[1]) * scaling
         gear_radius = g.teeth * 1.8 * scaling
-        # Simple circular hit test
         dx = mx - center_x
         dy = my - center_y
         if (dx*dx + dy*dy) < (gear_radius * gear_radius):
           hovered_gear_idx = idx
           break
       
+      # Check for hovered dog clutch
+      if hovered_gear_idx is None:
+        for idx, dc in enumerate(dog_clutches):
+          y = axle_displacement[dc.offset[1]//150]
+          x = WINDOW_WIDTH/2 + (dc.offset[0] + pan_offset[0]) * scaling
+          y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
+          clutch_size = 30 * scaling
+          if abs(mx - x) < clutch_size and abs(my - y) < clutch_size:
+            hovered_dog_clutch_idx = idx
+            break
+      
+      # Check for hovered slipping clutch
+      if hovered_gear_idx is None and hovered_dog_clutch_idx is None:
+        for idx, sc in enumerate(slipping_clutches):
+          y = axle_displacement[sc.offset[1]//150]
+          x = WINDOW_WIDTH/2 + (sc.offset[0] + pan_offset[0]) * scaling
+          y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
+          clutch_size = 40 * scaling
+          if abs(mx - x) < clutch_size and abs(my - y) < clutch_size:
+            hovered_slip_clutch_idx = idx
+            break
+      
+      # Check for hovered engine
+      if hovered_gear_idx is None and hovered_dog_clutch_idx is None and hovered_slip_clutch_idx is None:
+        for engine in Engines:
+          if engine is None: continue
+          g = gears[engine.conected_gear_index]
+          center_x = WINDOW_WIDTH/2 + (g.offset[0] - 150 + pan_offset[0]) * scaling
+          center_y = WINDOW_HEIGHT/2 + (axle_displacement[g.offset[1]//150] + pan_offset[1]) * scaling
+          if abs(mx - center_x) < 50*scaling and abs(my - center_y) < 50*scaling:
+            hovered_engine = engine
+            break
+      
+      # Display stats for hovered gear
       if hovered_gear_idx is not None:
-        # Highlight the hovered gear
         g = gears[hovered_gear_idx]
         center_x = WINDOW_WIDTH/2 + (g.offset[0] + pan_offset[0]) * scaling
         center_y = WINDOW_HEIGHT/2 + (axle_displacement[g.offset[1]//150] + pan_offset[1]) * scaling
         gear_radius = g.teeth * 1.8 * scaling
         pygame.draw.circle(screen, (255, 255, 0), (int(center_x), int(center_y)), int(gear_radius), max(2, int(3*scaling)))
         
-        # Draw outside connections (vertical, external mesh) in bright green
+        # Draw connections
         for idx1, idx2 in outside_conections:
           if idx1 == hovered_gear_idx or idx2 == hovered_gear_idx:
-            g1 = gears[idx1]
-            g2 = gears[idx2]
+            g1, g2 = gears[idx1], gears[idx2]
             x1 = WINDOW_WIDTH/2 + (g1.offset[0] + pan_offset[0]) * scaling
             y1 = WINDOW_HEIGHT/2 + (axle_displacement[g1.offset[1]//150] + pan_offset[1]) * scaling
             x2 = WINDOW_WIDTH/2 + (g2.offset[0] + pan_offset[0]) * scaling
             y2 = WINDOW_HEIGHT/2 + (axle_displacement[g2.offset[1]//150] + pan_offset[1]) * scaling
             pygame.draw.line(screen, (0, 255, 0), (int(x1), int(y1)), (int(x2), int(y2)), max(3, int(4*scaling)))
         
-        # Draw axle connections (horizontal) in yellow-green
         for idx1, idx2 in axle_conections:
           if idx1 == hovered_gear_idx or idx2 == hovered_gear_idx:
-            g1 = gears[idx1]
-            g2 = gears[idx2]
+            g1, g2 = gears[idx1], gears[idx2]
             x1 = WINDOW_WIDTH/2 + (g1.offset[0] + pan_offset[0]) * scaling
             y1 = WINDOW_HEIGHT/2 + (axle_displacement[g1.offset[1]//150] + pan_offset[1]) * scaling
             x2 = WINDOW_WIDTH/2 + (g2.offset[0] + pan_offset[0]) * scaling
             y2 = WINDOW_HEIGHT/2 + (axle_displacement[g2.offset[1]//150] + pan_offset[1]) * scaling
             pygame.draw.line(screen, (150, 255, 0), (int(x1), int(y1)), (int(x2), int(y2)), max(3, int(4*scaling)))
         
-        # Draw gear name/info
-        font = pygame.font.SysFont("Arial", int(16*scaling) if scaling > 0.5 else 12)
-        info_text = f"{g.name} - {g.speed*60/(2*pi):.0f} RPM"
-        text_surface = font.render(info_text, True, (255, 255, 0))
-        screen.blit(text_surface, (int(center_x - 50*scaling), int(center_y - gear_radius - 25*scaling)))
+        # Gear stats
+        font = pygame.font.SysFont("Arial", 14)
+        stats = [
+          f"Gear: {g.name}",
+          f"Index: {hovered_gear_idx}",
+          f"Teeth: {g.teeth}",
+          f"RPM: {g.speed*60/(2*pi):.1f}",
+          f"Rad/s: {g.speed:.2f}",
+          f"Angle: {g.angle:.2f} rad",
+          f"Inertia: {g.inertia:.6f} kg·m²",
+          f"Drag: {g.drag:.4f}"
+        ]
+        for i, stat in enumerate(stats):
+          text_surface = font.render(stat, True, (255, 255, 0), (0, 0, 0))
+          screen.blit(text_surface, (10, 70 + i*18))
+      
+      # Display stats for hovered dog clutch
+      elif hovered_dog_clutch_idx is not None:
+        dc = dog_clutches[hovered_dog_clutch_idx]
+        y = axle_displacement[dc.offset[1]//150]
+        x = WINDOW_WIDTH/2 + (dc.offset[0] + pan_offset[0]) * scaling
+        y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
+        pygame.draw.rect(screen, (255, 255, 0), (x-20*scaling, y-20*scaling, 40*scaling, 40*scaling), max(2, int(3*scaling)))
+        
+        # Dog clutch stats
+        font = pygame.font.SysFont("Arial", 14)
+        g_left = gears[dc.left_gear_index]
+        g_right = gears[dc.right_gear_index]
+        g_shaft = gears[dc.right_most_axle_conected_gear_index]
+        
+        target_gear = g_left if dc.engaged == -1 else g_right
+        speed_diff = abs(target_gear.speed - g_shaft.speed) if dc.engaged != 0 else 0
+        
+        sync_state_names = ["Disengaged", "Syncing", "Locked"]
+        stats = [
+          f"Dog Clutch #{hovered_dog_clutch_idx}",
+          f"Engaged: {dc.engaged} ({['Neutral','Left','Right'][dc.engaged+1]})",
+          f"State: {sync_state_names[dc.sync_state]}",
+          f"Engagement: {dc.dog_engagement_speed*100:.1f}%",
+          f"Speed diff: {speed_diff:.2f} rad/s ({speed_diff*60/(2*pi):.0f} RPM)",
+          f"Left gear: {g_left.name} ({g_left.speed*60/(2*pi):.0f} RPM)",
+          f"Right gear: {g_right.name} ({g_right.speed*60/(2*pi):.0f} RPM)",
+          f"Shaft gear: {g_shaft.name} ({g_shaft.speed*60/(2*pi):.0f} RPM)",
+          f"Sync tolerance: {dc.sync_tolerance:.1f} rad/s",
+          f"Friction coef: {dc.sync_cone_friction_coef:.3f}"
+        ]
+        for i, stat in enumerate(stats):
+          text_surface = font.render(stat, True, (255, 255, 0), (0, 0, 0))
+          screen.blit(text_surface, (10, 70 + i*18))
+      
+      # Display stats for hovered slipping clutch
+      elif hovered_slip_clutch_idx is not None:
+        sc = slipping_clutches[hovered_slip_clutch_idx]
+        y = axle_displacement[sc.offset[1]//150]
+        x = WINDOW_WIDTH/2 + (sc.offset[0] + pan_offset[0]) * scaling
+        y = WINDOW_HEIGHT/2 + (y + pan_offset[1]) * scaling
+        pygame.draw.rect(screen, (255, 255, 0), (x-30*scaling, y-30*scaling, 60*scaling, 60*scaling), max(2, int(3*scaling)))
+        
+        # Slipping clutch stats
+        font = pygame.font.SysFont("Arial", 14)
+        g_left = gears[sc.left_gear_index]
+        g_right = gears[sc.right_gear_index]
+        speed_diff = abs(g_left.speed - g_right.speed)
+        
+        stats = [
+          f"Slipping Clutch #{hovered_slip_clutch_idx} (C{sc.clutch_type})",
+          f"Engaged: {sc.engaged*100:.1f}%",
+          f"Locked: {'Yes' if sc.is_locked else 'No'}",
+          f"Speed diff: {speed_diff:.2f} rad/s ({speed_diff*60/(2*pi):.0f} RPM)",
+          f"Left gear: {g_left.name} ({g_left.speed*60/(2*pi):.0f} RPM)",
+          f"Right gear: {g_right.name} ({g_right.speed*60/(2*pi):.0f} RPM)",
+          f"Lock tolerance: {sc.lock_tolerance:.1f} rad/s",
+          f"Max torque: {sc.max_torque:.1f} N·m",
+          f"Stiffness: {sc.stiffness:.1f}",
+          f"--- Constraint Forces ---",
+          f"C (position error): {sc.last_C:.2f}",
+          f"Cdot (velocity error): {sc.last_Cdot:.2f}",
+          f"Lambda (force): {sc.last_lambda:.2f} N·m"
+        ]
+        if sc.is_locked:
+          stats.append(f"Angle offset: {sc.angle_offset:.3f} rad")
+        
+        for i, stat in enumerate(stats):
+          text_surface = font.render(stat, True, (255, 255, 0), (0, 0, 0))
+          screen.blit(text_surface, (10, 70 + i*18))
+      
+      # Display stats for hovered engine
+      elif hovered_engine is not None:
+        g = gears[hovered_engine.conected_gear_index]
+        center_x = WINDOW_WIDTH/2 + (g.offset[0] - 150 + pan_offset[0]) * scaling
+        center_y = WINDOW_HEIGHT/2 + (axle_displacement[g.offset[1]//150] + pan_offset[1]) * scaling
+        pygame.draw.rect(screen, (255, 255, 0), (center_x-40*scaling, center_y-40*scaling, 80*scaling, 80*scaling), max(2, int(3*scaling)))
+        
+        # Engine stats
+        font = pygame.font.SysFont("Arial", 14)
+        rpm = hovered_engine.speed * 60 / (2*pi)
+        stats = [
+          f"Engine: {hovered_engine.name}",
+          f"RPM: {rpm:.0f}",
+          f"Rad/s: {hovered_engine.speed:.2f}",
+          f"Throttle: {hovered_engine.throttle*100:.1f}%",
+          f"Rev limit: {'ACTIVE' if hovered_engine.rev_limit_activated else 'Inactive'}",
+          f"Rev cut: {hovered_engine.rev_cut} RPM",
+          f"Rev act: {hovered_engine.rev_act} RPM",
+          f"Inertia: {hovered_engine.inertia:.4f} kg·m²",
+          f"Drag: {hovered_engine.drag:.4f}",
+          f"Friction: {hovered_engine.tau0:.2f} N·m",
+          f"Connected to: {gears[hovered_engine.conected_gear_index].name}"
+        ]
+        for i, stat in enumerate(stats):
+          text_surface = font.render(stat, True, (255, 255, 0), (0, 0, 0))
+          screen.blit(text_surface, (10, 70 + i*18))
     
     draw_rpm_gauge(Engines, (260/2, 260/2), np.zeros((260, 260, 3), dtype=np.uint8))
     
